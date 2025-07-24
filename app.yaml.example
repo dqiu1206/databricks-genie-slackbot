@@ -1,0 +1,10 @@
+command: ["python", "-m", "databricks_genie_slackbot"]
+
+# Environment variables
+env:
+  - name: "SECRET_SCOPE"
+    value: "<scope-name>"
+  - name: "GENIE_SPACE_ID"
+    value: "<your-genie-space-id>"
+  - name: "SHOW_SQL_QUERY"
+    value: "true" # set to "false" if you don't want to expose SQL queries to end users

@@ -1,0 +1,6 @@
+.databricks
+app.yaml
+.env
+databricks_genie_slackbot/__pycache__/
+databricks_genie_slackbot/.databricks
+
