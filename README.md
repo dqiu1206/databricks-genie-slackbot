@@ -1,215 +1,216 @@
-# Databricks Genie Slack Bot
+# About
+Ever wonder how you can deploy a Slackbot in Databricks Apps to connect to your Genie Space?
 
-A powerful Slack bot that integrates with Databricks Genie to provide conversational AI capabilities for data queries and analysis. The bot can now receive and send messages from **any channel** in Slack, making it more versatile and user-friendly.
+Well, now you can!
 
-## 🚀 Enhanced Features
+This simple (mostly vibe-coded) app allows you to let your slack users directly query your Databricks Genie Space without ever needing to log in to the Databricks Workspace. You can deploy this locally on your own computer or via Databricks Apps.
 
-### 📨 **Universal Channel Support**
-- **Any Channel**: The bot can now receive and send messages from any public or private channel
-- **Direct Messages**: Continue to support direct messages for private conversations
-- **App Mentions**: Support for @botname mentions in channels
-- **Automatic Channel Management**: Bot automatically joins channels when invited and handles permissions
+Disclaimer: This project is provided as-is for educational and demo purposes only. Please use it at your own risk!
 
-### 🔄 **Smart Message Handling**
-- **Thread-Based Conversations**: Each Slack thread maintains its own conversation context
-- **Message Queuing**: Multiple messages are processed sequentially to maintain conversation context
-- **Loop Prevention**: Advanced bot message detection to prevent infinite loops
-- **Duplicate Prevention**: Prevents processing the same message multiple times
+### What is a [Databricks Genie Space](https://docs.databricks.com/aws/en/genie/)
 
-### 📊 **Enhanced Query Processing**
-- **SQL Query Generation**: Genie generates and executes SQL queries automatically
-- **CSV File Export**: Query results are provided as downloadable CSV files
-- **Large File Handling**: Smart handling of files too large for Slack upload
-- **System Table Support**: Special handling for system table queries with proper guidance
+A **Databricks Genie Space** is a shared workspace where teams can use AI-powered apps (called Genies) to chat with their company data and get insights fast. You can ask questions, run queries, or explore reports using natural language, and everything stays secure and governed through Databricks. It’s an easy way for different teams—like sales, support, or engineering—to use AI tools built on their data, all in one place, without needing to be a data expert.
 
-### 🛡️ **Robust Error Handling**
-- **Graceful Degradation**: Continues working even when some features fail
-- **User-Friendly Errors**: Provides helpful error messages and suggestions
-- **Automatic Retry**: Implements fallback strategies for failed operations
-- **Performance Monitoring**: Real-time monitoring of bot performance and resource usage
+### What is [Databricks Apps](https://docs.databricks.com/aws/en/dev-tools/databricks-apps)?
+**Databricks Apps** let you build custom, interactive experiences right inside the Databricks workspace. You can use them to create tools, dashboards, or workflows tailored to your team’s needs, all with full access to your data and notebooks. It’s like giving your workspace superpowers—hook into events, add UI components, and create mini-apps without needing to leave Databricks.
 
-## 📋 Prerequisites
+## Key Features
+- Allow users to message Genie Space and get responses back!
+- Query results should return as a CSV file directly inside of your message
+- Messages within a single thread are tracked as a distinct "conversation" in Genie
+- Uses Websockets for connection (I chose this mostly due to enterprise security limitations with allowing HTTP connections into their workspace)
 
-### Slack App Configuration
-1. **Create a Slack App** at [api.slack.com/apps](https://api.slack.com/apps)
-2. **Enable Socket Mode** for real-time communication
-3. **Configure Bot Token Scopes**:
-   - `channels:history` - Read channel messages
-   - `channels:read` - View basic channel info
-   - `chat:write` - Send messages
-   - `files:write` - Upload files
-   - `groups:history` - Read private channel messages
-   - `groups:read` - View private channel info
-   - `im:history` - Read direct messages
-   - `im:read` - View direct message info
-   - `mpim:history` - Read group direct messages
-   - `mpim:read` - View group direct message info
-   - `users:read` - View user info
+## Limitations
+- Right now, since it is using the Databricks Apps Oauth permissions, you cannot view the history of your queries in the Databricks UI.
 
-4. **Configure Event Subscriptions**:
-   - `message.channels` - Channel messages
-   - `message.groups` - Private channel messages
-   - `message.im` - Direct messages
-   - `message.mpim` - Group direct messages
-   - `app_mention` - App mentions
-   - `channel_joined` - Bot joins channels
-   - `group_joined` - Bot joins private groups
 
-### Databricks Configuration
-1. **Databricks Workspace**: Access to a Databricks workspace
-2. **Genie Space**: A configured Genie space for AI conversations
-3. **Authentication**: Either OAuth2 service principal or Personal Access Token
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## 🛠️ Installation
+# Getting Started
+For this project, you will need to first set up a Slackbot (duh). Then, deploy the slackbot either to your own local computer or Databricks Apps.
 
-### 1. Clone the Repository
-```bash
-git clone <repository-url>
-cd databricks-genie-slackbot
+First clone this repository:
+
+```
+git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
 ```
 
-### 2. Install Dependencies
-```bash
-pip install -r requirements.txt
+## Setting Up a Slackbot
+
+1. Sign up with a Slack account (or if using your existing one - make sure you have the necessary permissions to create and install Apps)
+2. Go to api.slack.com -> Your Apps (top right corner)
+3. Create New App -> From a manifest -> Select your Workspace
+4. In the JSON tab, paste the following, change the name to what you want to name your bot, then click Next -> Create:
+
+```sh
+{
+    "display_information": {
+        "name": "Databricks Genie"
+    },
+    "features": {
+        "bot_user": {
+            "display_name": "Databricks Genie",
+            "always_online": true
+        }
+    },
+    "oauth_config": {
+        "scopes": {
+            "bot": [
+                "app_mentions:read",
+                "chat:write",
+                "files:write"
+            ]
+        }
+    },
+    "settings": {
+        "event_subscriptions": {
+            "bot_events": [
+                "app_mention"
+            ]
+        },
+        "interactivity": {
+            "is_enabled": true
+        },
+        "org_deploy_enabled": false,
+        "socket_mode_enabled": true,
+        "token_rotation_enabled": false
+    }
+}
+```
+5. In the left-hand sidebar under **App Home**, scroll to the bottom and click the box "Allow users to send Slash commands and messages from the messages tab". This will simply allow you to directly message the bot in a separate tab.
+
+6. Under **OAuth & Permissions** -> OAuth Tokens, install the app! You should get a token that starts with "xoxb-". This is your SLACK_BOT_TOKEN. Save this as you'll need this later.
+
+7. Finally, under **Basic Information**, scroll to **App-Level Tokens** and click **Generate Token and Scopes**. Name it whatever you want, add the "connections:write:" scope, and generate your token. This is your SLACK_APP_TOKEN and should start with  "xapp-". Save this for later as well.
+
+## Deploying to Databricks Apps
+
+1. We first need to put your SLACK_APP_TOKEN and SLACK_BOT_TOKEN into Databricks Secrets (which you should always use for security reasons or whatever).
+
+You can either go to a Databricks Notebook and paste in this code (replacing with the right values of course):
+
+```
+from databricks.sdk import WorkspaceClient
+
+w = WorkspaceClient()
+
+scope_name = "<scope-name>" # rename scope - you will need to put this as an env variable later
+w.secrets.create_scope(scope=scope_name)
+
+# Replace with app and bot tokens you generated earlier (hopefully)
+secrets = {
+    "SLACK_APP_TOKEN": "xapp-xxx",
+    "SLACK_BOT_TOKEN" : "xoxb-xxx"
+}
+
+for key, value in secrets.items():
+    w.secrets.put_secret(scope_name, key, string_value=value)
+
 ```
 
-### 3. Environment Configuration
-Copy the example environment file and configure your settings:
+OR
 
-```bash
+Use the databricks CLI.
+
+```
+databricks secrets create-scope <scope-name>
+```
+
+```
+databricks secrets put-secret <scope-name> SLACK_APP_TOKEN
+databricks secrets put-secret <scope-name> SLACK_BOT_TOKEN
+```
+
+2. We will now need to set up our env variables in [app.yaml](app.yaml). Databricks Apps uses this file to know what commands to run as well as any env variables you want to inject.
+
+Replace the values under SECRET_SCOPE, GENIE_SPACE_ID, and SHOW_SQL_QUERY (optional)
+
+```
+env:
+  - name: "SECRET_SCOPE"
+    value: "<scope-name>"
+  - name: "GENIE_SPACE_ID"
+    value: "<your-genie-space-id>"
+  - name: "SHOW_SQL_QUERY"
+    value: "true" # set to "false" if you don't want to expose SQL queries to end users
+```
+
+#### Create your Databricks App
+
+1. Follow this [guide](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/create-custom-app) to setup your App
+2. After it gets deployed, go to the parent directory of the app in the terminal and paste in the following 2 commands:
+
+Sync source files - you can copy this is in your Overview tab
+
+```
+databricks sync --watch . /Workspace/Users/david.qiu@databricks.com/databricks_apps/xxx/xxx
+```
+
+Deploy - under "Deploy to Databricks Apps"
+
+```
+databricks apps deploy slackbot-dq --source-code-path xxx
+```
+
+#### Congrats! Now, you should be able to message your Slackbot in Slack.
+
+## Deploying Locally
+
+1. Replace the .env.example file:
+
+```
 cp env.example .env
 ```
 
-Edit `.env` with your configuration:
+2. Fill out .env file with correct env variables. You will need to [generate a Personal Access Token (PAT)](https://docs.databricks.com/aws/en/dev-tools/auth/pat) in your Databricks workspace.
 
-```env
-# Databricks Configuration
-DATABRICKS_HOST=https://your-workspace.cloud.databricks.com
-DATABRICKS_ACCESS_TOKEN=your-personal-access-token
-# OR use OAuth2:
-# DATABRICKS_CLIENT_ID=your-client-id
-# DATABRICKS_CLIENT_SECRET=your-client-secret
-GENIE_SPACE_ID=your-genie-space-id
+3. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
 
-# Slack Configuration
-SLACK_APP_TOKEN=xapp-your-app-token
-SLACK_BOT_TOKEN=xoxb-your-bot-token
-
-# Optional Configuration
-SHOW_SQL_QUERY=true  # Set to false to hide SQL queries in responses
+```
+pip install -r requirements.txt
 ```
 
-### 4. Run the Bot
-```bash
-python slackbot.py
+4. Deploy the app
+
+```
+python -m databricks_genie_slackbot
 ```
 
-## 🎯 Usage
+#### Congrats! Now, you should be able to message your Slackbot in Slack.
 
-### Basic Interaction
-The bot can now be used in **any channel** where it's a member:
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-1. **Send a message** in any channel where the bot is present
-2. **Mention the bot** with @botname in any channel
-3. **Send direct messages** for private conversations
+  
+  
+  
 
-### Conversation Features
-- **Follow-up Questions**: Reply in the same thread to continue conversations
-- **Context Retention**: Genie remembers previous messages in the thread
-- **Thread-Based Conversations**: Each Slack thread maintains its own conversation
-- **Automatic Expiration**: Conversations expire after 1 hour of inactivity
+<!-- USAGE EXAMPLES -->
 
-### Special Commands
-- `/reset` - Clear conversation history and start fresh
-- `/help` - Show available commands and features
-- `/status` - Check current conversation status
+## Usage
 
-### Query Results
-- **CSV Files**: Query results are automatically provided as downloadable CSV files
-- **Large Files**: Files too large for Slack are handled gracefully with size information
-- **System Tables**: Special guidance for system table queries that may require permissions
+In Slack, you can either directly talk to your Slackbot under Apps (at the very bottom in the left sidebar), or mention (@) it in a channel (after adding it to the channel).
 
-## 🔧 Advanced Configuration
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-### Performance Settings
-The bot includes configurable performance settings in `slackbot/config.py`:
 
-```python
-# Core limits
-MAX_PROCESSED_MESSAGES = 1000
-MAX_CONVERSATION_AGE = 3600  # 1 hour
-SLACK_FILE_SIZE_LIMIT = 50 * 1024 * 1024  # 50MB
+## License
 
-# Performance settings
-POLL_INTERVAL = 3
-MAX_WAIT_TIME = 120
-```
+This project is licensed under the Apache License 2.0 - see the [LICENSE file](LICENSE) for details.
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-### Channel Management
-The bot automatically:
-- **Joins channels** when invited
-- **Checks permissions** before posting
-- **Handles private channels** with proper authentication
-- **Manages bot membership** across different channel types
+  
+  
+  
 
-## 🚨 Troubleshooting
+<!-- CONTACT -->
 
-### Common Issues
+## Contact
 
-1. **Bot not responding in channels**
-   - Ensure the bot is a member of the channel
-   - Check that the bot has the required scopes
-   - Verify the bot token is correct
+  
 
-2. **Permission errors**
-   - Check Databricks workspace permissions
-   - Verify Genie space access
-   - Ensure proper authentication credentials
+David Qiu - [LinkedIn](https://www.linkedin.com/in/daviqiu/)
 
-3. **File upload failures**
-   - Check file size limits (50MB max)
-   - Verify bot has `files:write` scope
-   - Ensure channel allows file uploads
 
-4. **Conversation context lost**
-   - Conversations expire after 1 hour of inactivity
-   - Use `/reset` to start fresh conversations
-   - Reply in the same thread to maintain context
+  
 
-### Logs and Monitoring
-The bot provides comprehensive logging:
-- **Performance metrics** are logged every minute
-- **Error details** are logged with context for debugging
-
-## 🔒 Security Considerations
-
-- **Token Security**: Keep Slack and Databricks tokens secure
-- **Channel Access**: Bot only accesses channels where it's explicitly added
-- **Data Privacy**: Query results are only shared with the requesting user
-- **Conversation Isolation**: Each thread maintains separate conversation context
-
-## 📈 Performance Features
-
-- **Connection Pooling**: Efficient Databricks API connection management
-- **Thread Pool**: Configurable worker threads for concurrent message processing
-- **Queue Management**: Sequential processing within channels to maintain context
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## 🆘 Support
-
-For issues and questions:
-1. Check the troubleshooting section
-2. Review the logs for error details
-3. Open an issue in the repository
-4. Contact your workspace administrator for Databricks-specific issues
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
