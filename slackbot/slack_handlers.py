@@ -9,7 +9,7 @@ import ssl
 import time
 import logging
 import threading
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import slack_sdk
 from slack_bolt import App
@@ -73,10 +73,97 @@ def get_socket_handler(slack_app: App, bot_state) -> SocketModeHandler:
         raise
 
 
+def get_channel_info(client, channel_id: str) -> Optional[Dict[str, Any]]:
+    """Get channel information to determine channel type and permissions."""
+    try:
+        # Try to get channel info
+        response = client.conversations_info(channel=channel_id)
+        if response.get('ok'):
+            return response.get('channel', {})
+    except Exception as e:
+        logger.debug(f"Could not get channel info for {channel_id}: {e}")
+    
+    return None
+
+
+def can_bot_post_to_channel(client, channel_id: str) -> bool:
+    """Check if the bot can post to a specific channel."""
+    # Direct messages (DMs) always allow the bot to post
+    if channel_id.startswith("D"):
+        logger.debug(f"Channel {channel_id} is a DM - bot can always post")
+        return True
+    
+    try:
+        # Get channel info
+        channel_info = get_channel_info(client, channel_id)
+        if not channel_info:
+            return False
+        
+        # Check if bot is a member of the channel
+        is_member = channel_info.get('is_member', False)
+        if not is_member:
+            logger.debug(f"Bot is not a member of channel {channel_id}")
+            return False
+        
+        # Check channel type
+        channel_type = channel_info.get('is_private', False)
+        if channel_type:
+            logger.debug(f"Channel {channel_id} is private - bot must be explicitly invited")
+        else:
+            logger.debug(f"Channel {channel_id} is public")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error checking bot permissions for channel {channel_id}: {e}")
+        return False
+
+
+def invite_bot_to_channel(client, channel_id: str) -> bool:
+    """Attempt to invite the bot to a channel."""
+    # Cannot invite bot to DM channels
+    if channel_id.startswith("D"):
+        logger.debug(f"Cannot invite bot to DM channel {channel_id}")
+        return False
+    
+    try:
+        # Get bot user ID
+        auth_test = client.auth_test()
+        bot_user_id = auth_test.get('user_id')
+        
+        if not bot_user_id:
+            logger.error("Could not get bot user ID")
+            return False
+        
+        # Try to invite bot to channel
+        response = client.conversations_invite(
+            channel=channel_id,
+            users=[bot_user_id]
+        )
+        
+        if response.get('ok'):
+            logger.info(f"Successfully invited bot to channel {channel_id}")
+            return True
+        else:
+            error = response.get('error', 'unknown error')
+            logger.warning(f"Failed to invite bot to channel {channel_id}: {error}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error inviting bot to channel {channel_id}: {e}")
+        return False
+
+
 def setup_slack_handlers(bot_state) -> None:
     """Set up Slack event handlers."""
     if bot_state.slack_app is not None:
         logger.info("Setting up Slack event handlers...")
+        
+        # Add a test handler to verify events are being received
+        @bot_state.slack_app.event("hello")
+        def handle_hello(event: Dict[str, Any]) -> None:
+            """Handle Socket Mode hello event for connection verification."""
+            logger.info("👋 Socket Mode connected successfully - received hello event")
         
         def process_message(event: Dict[str, Any], say, client) -> None:
             """Add message to channel queue for sequential processing."""
@@ -94,25 +181,87 @@ def setup_slack_handlers(bot_state) -> None:
         
         @bot_state.slack_app.event("message")
         def handle_message(event: Dict[str, Any], say) -> None:
-            """Handle direct messages only (not channel messages)."""
-            logger.debug(f"📨 Received message event: {event.get('type', 'unknown')}")
-            # Only respond to direct messages, not channel messages
+            """Handle all messages including channel messages, direct messages, and group messages."""
+            logger.info(f"📨 Received message event: {event.get('type', 'unknown')}, channel: {event.get('channel', 'unknown')}, user: {event.get('user', 'unknown')}, text: {event.get('text', '')[:50]}")
+            
+            # Get channel information
             channel_id = event.get("channel", "")
-            if channel_id.startswith("D"):  # Direct message channels start with "D"
-                logger.debug(f"Processing direct message in channel {channel_id}")
-                if bot_state.slack_app and bot_state.slack_app.client:
-                    process_message(event, say, bot_state.slack_app.client)
-            else:
-                logger.debug(f"Ignoring channel message in {channel_id} - only responding to direct messages")
+            user_id = event.get("user", "")
+            
+            # Skip bot messages to prevent loops
+            if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
+                logger.debug("Ignoring bot message to prevent loops")
+                return
+            
+            # Skip messages from the bot itself
+            if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
+                logger.debug("Ignoring message from bot itself")
+                return
+            
+            # Check if we can process this message
+            if bot_state.slack_app and bot_state.slack_app.client:
+                # Check channel type and permissions
+                channel_info = get_channel_info(bot_state.slack_app.client, channel_id)
+                
+                if channel_info:
+                    channel_type = "private" if channel_info.get('is_private', False) else "public"
+                    channel_name = channel_info.get('name', 'unknown')
+                    logger.debug(f"Processing message in {channel_type} channel: #{channel_name} ({channel_id})")
+                    
+                    # Check if bot can post to this channel
+                    if can_bot_post_to_channel(bot_state.slack_app.client, channel_id):
+                        process_message(event, say, bot_state.slack_app.client)
+                    else:
+                        logger.warning(f"Bot cannot post to channel {channel_id} - may need to be invited")
+                        # Try to invite bot to channel
+                        if invite_bot_to_channel(bot_state.slack_app.client, channel_id):
+                            # Retry processing after successful invite
+                            process_message(event, say, bot_state.slack_app.client)
+                        else:
+                            logger.error(f"Failed to invite bot to channel {channel_id} - message will not be processed")
+                else:
+                    # For direct messages or channels we can't get info for, process anyway
+                    if channel_id.startswith("D"):  # Direct message
+                        logger.debug(f"Processing direct message in channel {channel_id}")
+                        process_message(event, say, bot_state.slack_app.client)
+                    else:
+                        logger.warning(f"Could not get channel info for {channel_id} - attempting to process anyway")
+                        process_message(event, say, bot_state.slack_app.client)
 
         @bot_state.slack_app.event("app_mention")
         def handle_app_mention(event: Dict[str, Any], say) -> None:
             """Handle app mentions (@botname) in channels."""
-            logger.debug(f"📨 Received app_mention event: {event.get('type', 'unknown')}")
+            logger.info(f"📨 Received app_mention event: {event.get('type', 'unknown')}, channel: {event.get('channel', 'unknown')}, user: {event.get('user', 'unknown')}")
             if bot_state.slack_app and bot_state.slack_app.client:
                 process_message(event, say, bot_state.slack_app.client)
         
+        # Add handler for channel join events to automatically invite bot when needed
+        @bot_state.slack_app.event("channel_joined")
+        def handle_channel_joined(event: Dict[str, Any]) -> None:
+            """Handle when bot joins a channel."""
+            channel_id = event.get("channel", {}).get("id")
+            channel_name = event.get("channel", {}).get("name", "unknown")
+            if channel_id:
+                logger.info(f"Bot joined channel #{channel_name} ({channel_id})")
+        
+        @bot_state.slack_app.event("group_joined")
+        def handle_group_joined(event: Dict[str, Any]) -> None:
+            """Handle when bot joins a private group."""
+            channel_id = event.get("channel", {}).get("id")
+            channel_name = event.get("channel", {}).get("name", "unknown")
+            if channel_id:
+                logger.info(f"Bot joined private group #{channel_name} ({channel_id})")
+        
+        # Add catch-all handler for debugging
+        @bot_state.slack_app.event("*")
+        def handle_all_events(event: Dict[str, Any]) -> None:
+            """Catch-all handler for debugging unhandled events."""
+            event_type = event.get('type', 'unknown')
+            if event_type not in ['message', 'app_mention', 'hello', 'channel_joined', 'group_joined']:
+                logger.warning(f"🔍 Unhandled event type: {event_type}, event: {event}")
+        
         logger.info("✅ Slack event handlers registered successfully")
+        logger.info("📡 Registered event handlers: message, app_mention, channel_joined, group_joined, hello")
     else:
         logger.error("❌ Cannot set up Slack handlers - slack_app is None")
 
@@ -131,14 +280,28 @@ def start_socket_mode(bot_state) -> None:
                 bot_state.socket_handler.start()
         except Exception as e:
             logger.error(f"Socket Mode handler error: {e}")
+            bot_state.socket_handler_error = e
     
     bot_state.socket_thread = threading.Thread(target=run_socket_handler, daemon=True)
     bot_state.socket_thread.start()
     logger.info("Socket Mode handler started in background thread")
     
-    # Give it a moment to start and log any immediate errors
+    # Give it a moment to start and verify connection
     time.sleep(Config.SOCKET_CONNECTION_DELAY)
+    
+    # Check if thread is alive and handler is running
     if bot_state.socket_thread.is_alive():
         logger.info("✅ Socket Mode thread is running")
+        
+        # Additional verification - check if handler is actually connected
+        time.sleep(2)  # Give more time for connection
+        if hasattr(bot_state.socket_handler, 'client') and bot_state.socket_handler.client:
+            logger.info("✅ Socket Mode WebSocket client is initialized")
+        else:
+            logger.warning("⚠️ Socket Mode client may not be properly connected")
+            
+        # Check for any errors during startup
+        if hasattr(bot_state, 'socket_handler_error') and bot_state.socket_handler_error:
+            logger.error(f"❌ Socket handler encountered error: {bot_state.socket_handler_error}")
     else:
         logger.error("❌ Socket Mode thread failed to start") 

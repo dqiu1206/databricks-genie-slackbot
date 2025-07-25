@@ -18,16 +18,15 @@ from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
-from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from databricks.sdk import WorkspaceClient
 
 from .config import Config
 from .databricks_client import (
-    DatabricksConnectionPool, get_databricks_client, return_databricks_client,
-    wait_for_message_completion, wait_for_query_completion_if_needed,
-    execute_query_with_fallback, extract_conversation_ids
+    get_databricks_client, initialize_dbutils, extract_conversation_ids,
+    wait_for_message_completion, execute_query_with_fallback, 
+    wait_for_query_completion_if_needed
 )
 
 logger = logging.getLogger(__name__)
@@ -37,101 +36,12 @@ logger = logging.getLogger(__name__)
 class PerformanceMetrics:
     """Comprehensive performance metrics for monitoring."""
     query_count: int = 0
-    cache_hits: int = 0
-    cache_misses: int = 0
     avg_response_time: float = 0.0
     memory_usage_mb: float = 0.0
     active_connections: int = 0
     queue_depth: int = 0
     error_count: int = 0
     last_updated: datetime = field(default_factory=datetime.now)
-
-
-class LRUCache:
-    """Thread-safe LRU cache with TTL support for query results."""
-    
-    def __init__(self, max_size: int = Config.CACHE_SIZE, ttl: int = Config.CACHE_TTL):
-        self.max_size = max_size
-        self.ttl = ttl
-        self.cache = OrderedDict()
-        self.timestamps = {}
-        self.lock = RLock()
-        self.hits = 0
-        self.misses = 0
-        
-        # Start cleanup thread
-        self.cleanup_thread = threading.Thread(target=self._periodic_cleanup, daemon=True)
-        self.cleanup_thread.start()
-    
-    def _is_expired(self, key: str) -> bool:
-        """Check if a cache entry has expired."""
-        if key not in self.timestamps:
-            return True
-        return time.time() - self.timestamps[key] > self.ttl
-    
-    def _periodic_cleanup(self):
-        """Periodically clean up expired entries."""
-        while True:
-            try:
-                time.sleep(Config.CLEANUP_INTERVAL)
-                self._cleanup_expired()
-            except Exception as e:
-                logger.error(f"Error in cache cleanup: {e}")
-    
-    def _cleanup_expired(self):
-        """Remove expired entries from cache."""
-        with self.lock:
-            expired_keys = [k for k in self.cache.keys() if self._is_expired(k)]
-            for key in expired_keys:
-                del self.cache[key]
-                del self.timestamps[key]
-            if expired_keys:
-                logger.debug(f"Cleaned up {len(expired_keys)} expired cache entries")
-    
-    def get(self, key: str) -> Optional[Any]:
-        """Get value from cache."""
-        with self.lock:
-            if key in self.cache and not self._is_expired(key):
-                # Move to end (most recently used)
-                value = self.cache.pop(key)
-                self.cache[key] = value
-                self.hits += 1
-                return value
-            else:
-                if key in self.cache:
-                    # Expired entry
-                    del self.cache[key]
-                    del self.timestamps[key]
-                self.misses += 1
-                return None
-    
-    def put(self, key: str, value: Any):
-        """Put value in cache."""
-        with self.lock:
-            if key in self.cache:
-                del self.cache[key]
-            elif len(self.cache) >= self.max_size:
-                # Remove least recently used
-                oldest_key = next(iter(self.cache))
-                del self.cache[oldest_key]
-                del self.timestamps[oldest_key]
-            
-            self.cache[key] = value
-            self.timestamps[key] = time.time()
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
-        with self.lock:
-            total_requests = self.hits + self.misses
-            hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
-            return {
-                "size": len(self.cache),
-                "max_size": self.max_size,
-                "hits": self.hits,
-                "misses": self.misses,
-                "hit_rate": hit_rate,
-                "ttl": self.ttl
-            }
 
 
 class PerformanceMonitor:
@@ -190,27 +100,11 @@ class PerformanceMonitor:
             else:
                 self.metrics.error_count += 1
     
-    def record_cache_hit(self):
-        """Record a cache hit."""
-        with self.lock:
-            self.metrics.cache_hits += 1
-    
-    def record_cache_miss(self):
-        """Record a cache miss."""
-        with self.lock:
-            self.metrics.cache_misses += 1
-    
     def get_metrics(self) -> Dict[str, Any]:
         """Get current performance metrics."""
         with self.lock:
-            total_cache_requests = self.metrics.cache_hits + self.metrics.cache_misses
-            cache_hit_rate = (self.metrics.cache_hits / total_cache_requests * 100) if total_cache_requests > 0 else 0
-            
             return {
                 "query_count": self.metrics.query_count,
-                "cache_hits": self.metrics.cache_hits,
-                "cache_misses": self.metrics.cache_misses,
-                "cache_hit_rate": cache_hit_rate,
                 "avg_response_time": self.metrics.avg_response_time,
                 "memory_usage_mb": self.metrics.memory_usage_mb,
                 "error_count": self.metrics.error_count,
@@ -227,6 +121,7 @@ class BotState:
         self.slack_app: Optional[Any] = None
         self.socket_handler: Optional[Any] = None
         self.socket_thread: Optional[threading.Thread] = None
+        self.socket_handler_error: Optional[Exception] = None
         self.bot_user_id: Optional[str] = None
         self.dbutils: Optional[Any] = None
         
@@ -237,9 +132,12 @@ class BotState:
         self.slack_bot_token: Optional[str] = None
         self.show_sql_query: bool = True
         
+        # Authentication fields for Databricks client
+        self.client_id: Optional[str] = None
+        self.client_secret: Optional[str] = None
+        self.access_token: Optional[str] = None
+        
         # Performance optimizations
-        self.connection_pool = DatabricksConnectionPool()
-        self.query_cache = LRUCache()
         self.performance_monitor = PerformanceMonitor()
         
         # Thread-safe data structures
@@ -266,73 +164,98 @@ class BotState:
             thread_name_prefix="slackbot_worker"
         )
         
-        # Memory management
-        self.last_memory_cleanup = time.time()
-        self.memory_cleanup_interval = 300  # 5 minutes
+        # Genie API rate limiting
+        self.genie_rate_limiter = threading.Semaphore(Config.GENIE_MAX_CONCURRENT_CONVERSATIONS)
+        self.genie_api_calls = []  # Track API call timestamps for rate limiting
+        self.genie_calls_lock = RLock()  # Lock for thread-safe API call tracking
+        
+
 
 
 # Global bot state
 bot_state = BotState()
 
 
-def check_memory_usage_and_cleanup(bot_state) -> None:
-    """Monitor memory usage and trigger cleanup if needed."""
+
+
+
+def check_genie_rate_limit(bot_state) -> bool:
+    """Check if we can make a Genie API call within rate limits."""
+    current_time = time.time()
+    
+    with bot_state.genie_calls_lock:
+        # Remove API calls older than 1 minute
+        cutoff_time = current_time - 60
+        bot_state.genie_api_calls = [call_time for call_time in bot_state.genie_api_calls if call_time > cutoff_time]
+        
+        # Check if we're under the rate limit
+        if len(bot_state.genie_api_calls) >= Config.GENIE_RATE_LIMIT_PER_MINUTE:
+            logger.warning(f"Rate limit reached: {len(bot_state.genie_api_calls)} calls in the last minute")
+            return False
+        
+        # Record this API call
+        bot_state.genie_api_calls.append(current_time)
+        return True
+
+
+def wait_for_genie_api_slot(bot_state, timeout: float = 30.0) -> bool:
+    """Wait for an available Genie API slot with timeout."""
     try:
+        acquired = bot_state.genie_rate_limiter.acquire(timeout=timeout)
+        if not acquired:
+            logger.warning("Failed to acquire Genie API slot within timeout")
+        return acquired
+    except Exception as e:
+        logger.error(f"Error acquiring Genie API slot: {e}")
+        return False
+
+
+def release_genie_api_slot(bot_state) -> None:
+    """Release a Genie API slot."""
+    try:
+        bot_state.genie_rate_limiter.release()
+    except Exception as e:
+        logger.error(f"Error releasing Genie API slot: {e}")
+
+
+def wait_for_message_completion_with_backoff(workspace_client: WorkspaceClient, space_id: str, conversation_id: str, message_id: str):
+    """Wait for message completion with exponential backoff after 2 minutes."""
+    from .databricks_client import wait_for_message_completion
+    
+    start_time = time.time()
+    poll_interval = Config.GENIE_POLL_INTERVAL
+    max_wait_time = Config.GENIE_MESSAGE_TIMEOUT
+    backoff_threshold = Config.GENIE_BACKOFF_THRESHOLD
+    
+    logger.info(f"Waiting for message completion with improved polling (interval: {poll_interval}s, max: {max_wait_time}s)")
+    
+    while time.time() - start_time < max_wait_time:
         try:
-            import psutil
-            process = psutil.Process()
-            memory_percent = process.memory_percent()
+            elapsed = time.time() - start_time
             
-            if memory_percent > Config.MEMORY_THRESHOLD:
-                logger.warning(f"High memory usage detected: {memory_percent:.1f}%")
-                trigger_cleanup(bot_state)
-        except ImportError:
-            logger.debug("psutil not available, skipping memory check")
+            # Use exponential backoff after 2 minutes
+            if elapsed > backoff_threshold:
+                # Exponential backoff: double the interval, max 30s
+                current_interval = min(poll_interval * (2 ** int((elapsed - backoff_threshold) / 30)), 30)
+                logger.debug(f"Using exponential backoff: {current_interval}s interval")
+            else:
+                current_interval = poll_interval
             
-    except Exception as e:
-        logger.error(f"Error checking memory usage: {e}")
-
-
-def trigger_cleanup(bot_state) -> None:
-    """Trigger cleanup procedures."""
-    try:
-        # Clean up expired conversations
-        cleanup_expired_conversations(bot_state)
-        
-        # Clean up processed messages
-        cleanup_processed_messages(bot_state)
-        
-        # Force garbage collection
-        import gc
-        gc.collect()
-        
-        logger.info("Cleanup completed")
-        
-    except Exception as e:
-        logger.error(f"Error in cleanup: {e}")
-
-
-def generate_query_cache_key(query: str, space_id: str, conversation_id: Optional[str] = None) -> str:
-    """Generate a cache key for query results."""
-    # Create a deterministic key based on query content
-    key_data = f"{query.strip().lower()}:{space_id}"
-    if conversation_id:
-        key_data += f":{conversation_id}"
+            # Try to get message completion
+            result = wait_for_message_completion(workspace_client, space_id, conversation_id, message_id)
+            if result:  # Message completed
+                logger.info(f"Message completed after {elapsed:.1f}s")
+                return result
+            
+            # Wait before next poll
+            time.sleep(current_interval)
+            
+        except Exception as e:
+            logger.error(f"Error during message polling: {e}")
+            time.sleep(poll_interval)
     
-    return hashlib.md5(key_data.encode()).hexdigest()
-
-
-def should_cache_query(query: str) -> bool:
-    """Determine if a query should be cached."""
-    query_lower = query.lower()
-    
-    # Don't cache queries with current date/time functions
-    non_cacheable_patterns = [
-        'current_date', 'current_timestamp', 'now()', 'today()',
-        'rand()', 'random()', 'uuid()'
-    ]
-    
-    return not any(pattern in query_lower for pattern in non_cacheable_patterns)
+    logger.warning(f"Message polling timed out after {max_wait_time}s")
+    return None
 
 
 def get_conversation_key(channel_id: str, thread_ts: Optional[str], message_ts: Optional[str] = None) -> str:
@@ -398,59 +321,8 @@ def store_conversation_id(channel_id: str, thread_ts: Optional[str], conversatio
     logger.debug(f"Total active conversations: {len(bot_state.conversation_tracker)}")
 
 
-def cleanup_expired_conversations(bot_state) -> None:
-    """Clean up expired conversations to prevent memory leaks."""
-    current_time = time.time()
-    expired_keys = []
-    
-    with bot_state.conversation_lock:
-        for conversation_key, last_used in bot_state.conversation_timestamps.items():
-            if current_time - last_used >= Config.MAX_CONVERSATION_AGE:
-                expired_keys.append(conversation_key)
-        
-        for key in expired_keys:
-            logger.info(f"Cleaning up expired conversation for {key}")
-            if key in bot_state.conversation_tracker:
-                del bot_state.conversation_tracker[key]
-            if key in bot_state.conversation_timestamps:
-                del bot_state.conversation_timestamps[key]
-    
-    if expired_keys:
-        logger.info(f"Cleaned up {len(expired_keys)} expired conversations")
 
 
-def cleanup_processed_messages(bot_state) -> None:
-    """Clean up processed messages to prevent memory leaks."""
-    with bot_state.processed_messages_lock:
-        if len(bot_state.processed_messages) > Config.MAX_PROCESSED_MESSAGES:
-            bot_state.processed_messages = set(list(bot_state.processed_messages)[-500:])
-            logger.info(f"Cleaned up processed messages, now tracking {len(bot_state.processed_messages)} messages")
-    
-    with bot_state.processed_event_ids_lock:
-        if len(bot_state.processed_event_ids) > Config.MAX_PROCESSED_MESSAGES:
-            bot_state.processed_event_ids = set(list(bot_state.processed_event_ids)[-500:])
-            logger.info(f"Cleaned up processed event IDs, now tracking {len(bot_state.processed_event_ids)} events") 
-
-    # Clean up empty queues
-    cleanup_empty_queues(bot_state)
-
-
-def cleanup_empty_queues(bot_state) -> None:
-    """Clean up empty message queues to prevent memory leaks."""
-    with bot_state.queue_lock:
-        empty_channels = []
-        for channel_id, queue in bot_state.message_queue.items():
-            if not queue and channel_id not in bot_state.processing_channels:
-                empty_channels.append(channel_id)
-        
-        for channel_id in empty_channels:
-            del bot_state.message_queue[channel_id]
-            if channel_id in bot_state.queue_locks:
-                del bot_state.queue_locks[channel_id]
-            logger.debug(f"Cleaned up empty queue for channel {channel_id}")
-        
-        if empty_channels:
-            logger.info(f"Cleaned up {len(empty_channels)} empty message queues")
 
 
 def get_channel_queue_lock(channel_id: str, bot_state) -> RLock:
@@ -474,16 +346,17 @@ def add_message_to_queue(channel_id: str, event: Dict[str, Any], say, client, bo
         queue_length = len(bot_state.message_queue[channel_id])
         logger.info(f"📥 Added message to queue for channel {channel_id}. Queue length: {queue_length}")
         
-        # Send queue status message if this is not the first message
-        if queue_length > 1:
+        # Only show queue message if queue is getting long (more than 3 messages)
+        if queue_length > 3:
             try:
                 position = queue_length - 1  # 0-based index
-                say(f"⏳ *Message queued* - You are #{position} in line. I'll process your request as soon as possible!", thread_ts=event.get("ts"))
+                say(f"⏳ *High demand detected* - You are #{position} in line. Processing your request...", thread_ts=event.get("ts"))
             except Exception as e:
                 logger.error(f"Error sending queue status message: {e}")
         
-        # Start processing if not already processing
-        if channel_id not in bot_state.processing_channels:
+        # Start processing if not already processing OR if we have capacity
+        active_channels = len(bot_state.processing_channels)
+        if channel_id not in bot_state.processing_channels and active_channels < Config.MAX_CONCURRENT_CHANNELS:
             bot_state.processing_channels.add(channel_id)
             # Submit queue processing to thread pool
             bot_state.message_executor.submit(process_channel_queue, channel_id, bot_state)
@@ -538,6 +411,19 @@ def is_bot_message(event: Dict[str, Any], bot_state) -> bool:
     user_id = event.get("user")
     if user_id and bot_state.bot_user_id and user_id == bot_state.bot_user_id:
         return True
+    
+    # Fallback check using auth_test if bot_user_id is not set
+    if user_id and not bot_state.bot_user_id:
+        try:
+            # Get the client from bot_state if available
+            client = getattr(bot_state, 'slack_app', None)
+            if client and hasattr(client, 'client'):
+                bot_info = client.client.auth_test()
+                if bot_info and bot_info.get('user_id') == user_id:
+                    logger.info("Ignoring message from the bot itself to prevent loops (auth_test fallback)")
+                    return True
+        except Exception as e:
+            logger.warning(f"Could not verify bot info: {e}")
     
     return False
 
@@ -800,32 +686,21 @@ def format_query_summary(query_result: Any) -> str:
 
 
 def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
-    """Send a message to Databricks Genie and get a response with caching support."""
+    """Send a message to Databricks Genie and get a response with API best practices."""
     start_time = time.time()
+    api_slot_acquired = False
     
     try:
-        # Check cache first for non-conversation queries
-        cache_key = None
-        if not conversation_id and should_cache_query(msg_input):
-            cache_key = generate_query_cache_key(msg_input, str(bot_state.genie_space_id))
-            cached_result = bot_state.query_cache.get(cache_key)
-            
-            if cached_result:
-                bot_state.performance_monitor.record_cache_hit()
-                logger.info(f"Cache hit for query: {msg_input[:50]}...")
-                response_text, csv_bytes, filename, conv_id = cached_result
-                response_time = time.time() - start_time
-                bot_state.performance_monitor.record_query(response_time, success=True)
-                
-                # Add cache indicator to response
-                if isinstance(response_text, str):
-                    response_text += "\n\n*📚 Result retrieved from cache*"
-                
-                return response_text, csv_bytes, filename, conv_id
-            else:
-                bot_state.performance_monitor.record_cache_miss()
-
         logger.info(f"Processing query: {msg_input[:50]}...")
+        
+        # Wait for API slot and check rate limits
+        if not wait_for_genie_api_slot(bot_state):
+            return "⏳ System is at capacity. Please try again in a moment.", None, None, None
+        
+        api_slot_acquired = True
+        
+        if not check_genie_rate_limit(bot_state):
+            return "⏳ Rate limit reached. Please wait a moment before trying again.", None, None, None
         
         # Start or continue conversation
         if conversation_id:
@@ -850,8 +725,10 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
             logger.error(f"Missing conversation_id or message_id in response")
             return "Error: Could not retrieve conversation details from Genie's response.", None, None, conv_id
 
-        # Wait for message completion and process result
-        message_result = wait_for_message_completion(workspace_client, str(bot_state.genie_space_id), conv_id, message_id)
+        # Wait for message completion with improved polling (5-10s intervals)
+        message_result = wait_for_message_completion_with_backoff(
+            workspace_client, str(bot_state.genie_space_id), conv_id, message_id
+        )
         
         if not message_result:
             return "Error: Failed to get message response from Genie.", None, None, conv_id
@@ -868,22 +745,32 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
         else:
             # Return text-only response
             response_text = ' '.join(genie_text_response) if genie_text_response else 'No response from Genie.'
+            
+            # Clean up response - remove echoed input if it appears at the beginning
+            if response_text.lower().startswith(msg_input.lower().strip()):
+                # Remove the echoed input and any following whitespace
+                cleaned_response = response_text[len(msg_input):].strip()
+                if cleaned_response:
+                    response_text = cleaned_response
+            
             result = f"Genie: {response_text}", None, None, conv_id
         
-        # Cache the result if applicable
-        if cache_key and result and should_cache_query(msg_input):
-            bot_state.query_cache.put(cache_key, result)
-            logger.debug(f"Cached query result with key: {cache_key}")
-        
         response_time = time.time() - start_time
-        bot_state.performance_monitor.record_query(response_time, success=True)
+        if bot_state and hasattr(bot_state, 'performance_monitor'):
+            bot_state.performance_monitor.record_query(response_time, success=True)
         return result
         
     except Exception as e:
         logger.error(f"Error in Genie communication: {e}")
         response_time = time.time() - start_time
-        bot_state.performance_monitor.record_query(response_time, success=False)
+        if bot_state and hasattr(bot_state, 'performance_monitor'):
+            bot_state.performance_monitor.record_query(response_time, success=False)
         return create_error_response(e, "Genie communication")
+    
+    finally:
+        # Always release the API slot
+        if api_slot_acquired:
+            release_genie_api_slot(bot_state)
 
 
 def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, message_id: str, 
@@ -1232,26 +1119,27 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
         event_type = event.get("type", "unknown_type")
         event_ts = event.get("ts", "no_ts")
         event_id = event.get("event_id", "no_event_id")
-        logger.debug(f"🔍 Processing event - Type: {event_type}, TS: {event_ts}, Event ID: {event_id}")
+        logger.info(f"🔍 Processing event - Type: {event_type}, TS: {event_ts}, Event ID: {event_id}")
         
         # Check if this is a bot message
         if is_bot_message(event, bot_state):
-            logger.debug("Ignoring bot message to prevent loops")
+            logger.info("Ignoring bot message to prevent loops")
             return
         
         # Get message content
         message_content = event.get("text", "")
         if not message_content:
-            logger.debug("Received empty message, ignoring")
+            logger.info("Received empty message, ignoring")
             return
         
         # Check for duplicates
         if is_duplicate_message(event, message_content, bot_state):
+            logger.info("Ignoring duplicate message")
             return
         
         # Check for bot response patterns
         if is_bot_response_pattern(message_content):
-            logger.debug("Ignoring message that starts with bot response pattern to prevent loops")
+            logger.info("Ignoring message that starts with bot response pattern to prevent loops")
             return
         
         # Extract channel information
@@ -1262,26 +1150,31 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
         
         # Handle special commands
         if handle_special_commands(message_content, channel_id, thread_ts, message_ts, say, bot_state):
+            logger.info("Handled special command")
             return
         
         # Log message information
         logger.info(f"📨 Message received from user {user_id} in channel {channel_id}")
-        logger.debug(f"   Event type: {event_type}")
-        logger.debug(f"   Timestamp: {message_ts}")
-        logger.debug(f"   Thread timestamp: {thread_ts}")
-        logger.debug(f"   Message content: {message_content[:100]}{'...' if len(message_content) > 100 else ''}")
+        logger.info(f"   Event type: {event_type}")
+        logger.info(f"   Timestamp: {message_ts}")
+        logger.info(f"   Thread timestamp: {thread_ts}")
+        logger.info(f"   Message content: {message_content[:100]}{'...' if len(message_content) > 100 else ''}")
 
-        # Clean up processed messages to prevent memory leaks
-        cleanup_processed_messages(bot_state)
 
-        # Get workspace client from connection pool
-        workspace_client = None
-        try:
-            workspace_client = get_databricks_client(bot_state)
-        except Exception as e:
-            logger.error(f"Failed to get Databricks client: {e}")
-            say("❌ Databricks client not available. Please check the service configuration.", thread_ts=message_ts)
+
+        # Get workspace client from bot state
+        workspace_client = bot_state.workspace_client
+        if workspace_client is None:
+            logger.error("Databricks client not initialized")
+            # Use proper threading: thread_ts if in thread, message_ts if not
+            error_thread_ts = thread_ts if thread_ts else message_ts
+            say("❌ Databricks client not initialized. Please check the service configuration.", thread_ts=error_thread_ts)
             return
+        
+        # Determine the correct thread_ts for replies:
+        # - If message is already in a thread, use the existing thread_ts to stay in that thread
+        # - If message is not in a thread, use message_ts to create a new thread
+        reply_thread_ts = thread_ts if thread_ts else message_ts
         
         try:
             # Check for existing conversation in this thread
@@ -1292,31 +1185,27 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
             else:
                 logger.info(f"🆕 Starting new conversation in thread {thread_ts or 'new'} for user {user_id} in channel {channel_id}")
             
-            # Clean up expired conversations and check memory periodically
-            cleanup_expired_conversations(bot_state)
-            
-            # Check memory usage and trigger cleanup if needed
-            if time.time() - bot_state.last_memory_cleanup > bot_state.memory_cleanup_interval:
-                check_memory_usage_and_cleanup(bot_state)
-                bot_state.last_memory_cleanup = time.time()
+
             
             # Get response from Genie (continue existing or start new)
             try:
+                logger.info(f"🤖 Calling speak_with_genie with message: {message_content[:50]}...")
                 genie_response, csv_bytes, filename, conversation_id = speak_with_genie(
                     message_content, 
                     workspace_client, 
                     existing_conversation_id,  # Use existing conversation if available
                     bot_state
                 )
+                logger.info(f"✅ Received response from Genie, length: {len(genie_response) if genie_response else 0}")
             except Exception as genie_error:
                 logger.error(f"Error in speak_with_genie: {genie_error}")
                 genie_response = f"❌ Sorry, I encountered an error while processing your request: {str(genie_error)}"
                 csv_bytes, filename, conversation_id = None, None, None
         
-        finally:
-            # Always return the workspace client to the pool
-            if workspace_client:
-                return_databricks_client(workspace_client, bot_state)
+        except Exception as e:
+            logger.error(f"Error in conversation processing: {e}")
+            genie_response = f"❌ Sorry, I encountered an error while processing your request: {str(e)}"
+            csv_bytes, filename, conversation_id = None, None, None
         
         # Store the conversation ID if we got one (for new conversations or to update existing)
         if conversation_id:
@@ -1328,10 +1217,11 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
 
         # Send text response back to Slack
         logger.info(f"📤 Sending response to user {user_id} in channel {channel_id}")
-        logger.debug(f"   Response length: {len(genie_response)} characters")
-        logger.debug(f"   Response preview: {genie_response[:100]}{'...' if len(genie_response) > 100 else ''}")
+        logger.info(f"   Response length: {len(genie_response)} characters")
+        logger.info(f"   Response preview: {genie_response[:100]}{'...' if len(genie_response) > 100 else ''}")
+        logger.info(f"   Reply thread_ts: {reply_thread_ts} (original thread_ts: {thread_ts}, message_ts: {message_ts})")
         
-        say(genie_response, thread_ts=message_ts)
+        say(genie_response, thread_ts=reply_thread_ts)
         logger.info(f"✅ Response sent successfully to user {user_id}")
 
         # Upload CSV file if available and within size limits
@@ -1353,10 +1243,10 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
                 try:
                     logger.info(f"📁 Uploading CSV file to user {user_id}: {filename} ({size_str})")
                     
-                    # Upload file to Slack
+                    # Upload file to Slack - use proper thread timestamp
                     response = client.files_upload_v2(
                         channel=event.get("channel"),
-                        thread_ts=event.get("ts"),
+                        thread_ts=reply_thread_ts,
                         file=csv_bytes,
                         filename=filename,
                         title=f"Query Results - {filename}",
@@ -1365,15 +1255,15 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
                     logger.info(f"✅ Successfully uploaded file {filename} to user {user_id}")
                     
                     # Add a confirmation message
-                    say(f"✅ *File uploaded successfully!* {filename} ({size_str})", thread_ts=message_ts)
+                    say(f"✅ *File uploaded successfully!* {filename} ({size_str})", thread_ts=reply_thread_ts)
                     
                 except Exception as upload_error:
                     logger.error(f"Error uploading file to Slack: {upload_error}")
                     # If upload fails, provide error message
-                    say(f"📁 *File upload failed: {str(upload_error)}*", thread_ts=message_ts)
+                    say(f"📁 *File upload failed: {str(upload_error)}*", thread_ts=reply_thread_ts)
             else:
                 # File too large, provide guidance
-                say(f"📁 *File too large for Slack ({size_str}). Please try a more specific query with LIMIT clause.*", thread_ts=message_ts)
+                say(f"📁 *File too large for Slack ({size_str}). Please try a more specific query with LIMIT clause.*", thread_ts=reply_thread_ts)
         
         # Mark this message as processed
         message_hash = hashlib.md5(message_content.encode()).hexdigest()[:8]
@@ -1387,7 +1277,7 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
             if event_id != "no_event_id":
                 bot_state.processed_event_ids.add(event_id)
         
-        logger.debug(f"✅ Marked message as processed - Message key: {message_key}, Event ID: {event_id}")
+        logger.info(f"✅ Marked message as processed - Message key: {message_key}, Event ID: {event_id}")
         logger.info(f"✅ Completed processing for user {user_id}")
 
     except Exception as e:
@@ -1406,6 +1296,7 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
                 "• Check your network connection",
                 "• Try the query again in a few moments"
             ]
+            # Always use message timestamp for error messages to create threads
             say("\n".join(suggestions), thread_ts=event.get("ts"))
         elif "BAD_REQUEST" in error_message:
             say("❌ The query failed due to a bad request. This might be due to invalid SQL syntax or unsupported operations. Please check your query and try again.", thread_ts=event.get("ts"))
@@ -1499,15 +1390,37 @@ def main() -> None:
     """Main function to start the enhanced Slackbot."""
     try:
         logger.info("🚀 Starting enhanced Slackbot backend...")
+        logger.info(f"Environment: PORT={os.environ.get('PORT')}, DATABRICKS_HOST={os.environ.get('DATABRICKS_HOST')}")
+        logger.info(f"Working directory: {os.getcwd()}")
         
         # Initialize clients
         initialize_clients(bot_state)
         logger.info("✅ Slackbot backend initialized successfully with performance enhancements")
         
+        # Start Flask app
+        port = int(os.environ.get('PORT', 8080))
+        logger.info(f"🌐 Starting enhanced Flask web server on port {port}...")
+        logger.info("   📈 Performance enhancements enabled:")
+        logger.info("   • Connection pooling with health checks")
+        logger.info("   • Enhanced memory management")
+        logger.info("   • Real-time performance monitoring")
+        logger.info("   • Large buffer sizes for data retrieval")
+        
         # Start Socket Mode handler
         from .slack_handlers import start_socket_mode
         start_socket_mode(bot_state)
         logger.info("✅ Socket Mode handler started")
+        
+        # Wait a bit to ensure Socket Mode is fully connected
+        time.sleep(5)
+        
+        # Verify Socket Mode is running
+        if bot_state.socket_handler and hasattr(bot_state.socket_handler, 'is_running'):
+            if bot_state.socket_handler.is_running:
+                logger.info("✅ Socket Mode is running and connected")
+            else:
+                logger.error("❌ Socket Mode handler is not running properly")
+                logger.error("Please check your SLACK_APP_TOKEN and ensure it starts with 'xapp-'")
         
         # Start heartbeat thread for monitoring
         def heartbeat() -> None:
@@ -1522,27 +1435,21 @@ def main() -> None:
                     # Get performance metrics
                     try:
                         performance_metrics = bot_state.performance_monitor.get_metrics()
-                        connection_stats = bot_state.connection_pool.get_stats()
-                        cache_stats = bot_state.query_cache.get_stats()
+                        # connection_stats = bot_state.connection_pool.get_stats() # Removed as per edit hint
                         
                         logger.info(f"💓 Enhanced Heartbeat - Time: {datetime.now().isoformat()}")
                         logger.info(f"   📊 Performance - Avg Response: {performance_metrics.get('avg_response_time', 0):.2f}s, "
                                   f"Memory: {performance_metrics.get('memory_usage_mb', 0):.1f}MB, "
                                   f"Queries: {performance_metrics.get('query_count', 0)}")
-                        logger.info(f"   🔗 Connections - Pool: {connection_stats.get('pool_size', 0)}/{connection_stats.get('max_size', 0)}, "
-                                  f"Created: {connection_stats.get('created_connections', 0)}, "
-                                  f"Reused: {connection_stats.get('reused_connections', 0)}")
-                        logger.info(f"   📚 Cache - Size: {cache_stats.get('size', 0)}/{cache_stats.get('max_size', 0)}, "
-                                  f"Hit Rate: {cache_stats.get('hit_rate', 0):.1f}%")
+                        # logger.info(f"   🔗 Connections - Pool: {connection_stats.get('pool_size', 0)}/{connection_stats.get('max_size', 0)}, " # Removed as per edit hint
+                        #           f"Created: {connection_stats.get('created_connections', 0)}, " # Removed as per edit hint
+                        #           f"Reused: {connection_stats.get('reused_connections', 0)}") # Removed as per edit hint
                         logger.info(f"   📨 Queue - Active: {active_queues}, "
                                   f"Messages: {total_queued_messages}, "
                                   f"Processing: {len(bot_state.processing_channels)}")
                         logger.info(f"   💬 Conversations: {len(bot_state.conversation_tracker)}")
                         
-                        # Periodic cleanup check
-                        if performance_metrics.get('memory_usage_mb', 0) > Config.MEMORY_THRESHOLD:
-                            logger.warning("🧹 Triggering cleanup due to high memory usage")
-                            trigger_cleanup(bot_state)
+
                     except Exception as heartbeat_error:
                         logger.error(f"Error in enhanced heartbeat metrics: {heartbeat_error}")
                         # Basic heartbeat fallback
@@ -1561,77 +1468,21 @@ def main() -> None:
         
         # Set up graceful shutdown
         def signal_handler(sig, frame):
-            logger.info("🛑 Received shutdown signal, cleaning up...")
-            cleanup_and_shutdown()
+            logger.info("🛑 Received shutdown signal, shutting down...")
             sys.exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
         
-        # Start Flask app
-        logger.info("🌐 Starting enhanced Flask web server on port 8080...")
-        logger.info("   📈 Performance enhancements enabled:")
-        logger.info("   • Connection pooling with health checks")
-        logger.info("   • Intelligent query result caching")
-        logger.info("   • Enhanced memory management")
-        logger.info("   • Real-time performance monitoring")
-        logger.info("   • Large buffer sizes for data retrieval")
-        
         from .routes import app
-        app.run(debug=False, host='0.0.0.0', port=8080)
+        app.run(debug=False, host='0.0.0.0', port=port)
         
     except Exception as e:
         logger.error(f"❌ Failed to start enhanced Slackbot backend: {e}")
-        cleanup_and_shutdown()
         raise
 
 
-def cleanup_and_shutdown():
-    """Perform cleanup operations before shutdown."""
-    try:
-        logger.info("🧹 Starting graceful shutdown cleanup...")
-        
-        # Close all database connections
-        bot_state.connection_pool.close_all()
-        logger.info("✅ Closed all database connections")
-        
-        # Shutdown thread pool
-        if bot_state.message_executor:
-            bot_state.message_executor.shutdown(wait=True)
-            logger.info("✅ Shutdown message executor thread pool")
-        
-        # Close Socket Mode handler
-        if bot_state.socket_handler:
-            try:
-                if hasattr(bot_state.socket_handler, 'close'):
-                    bot_state.socket_handler.close()
-                    logger.info("✅ Closed Socket Mode handler")
-                else:
-                    logger.info("✅ Socket Mode handler doesn't have close method")
-            except Exception as e:
-                logger.warning(f"Error closing Socket Mode handler: {e}")
-        
-        # Final performance report
-        try:
-            performance_metrics = bot_state.performance_monitor.get_metrics()
-            connection_stats = bot_state.connection_pool.get_stats()
-            cache_stats = bot_state.query_cache.get_stats()
-            
-            logger.info("📊 Final Performance Report:")
-            logger.info(f"   • Total queries processed: {performance_metrics.get('query_count', 0)}")
-            logger.info(f"   • Average response time: {performance_metrics.get('avg_response_time', 0):.2f}s")
-            logger.info(f"   • Cache hit rate: {cache_stats.get('hit_rate', 0):.1f}%")
-            logger.info(f"   • Connections created: {connection_stats.get('created_connections', 0)}")
-            logger.info(f"   • Connections reused: {connection_stats.get('reused_connections', 0)}")
-            logger.info(f"   • Error count: {performance_metrics.get('error_count', 0)}")
-        except Exception as report_error:
-            logger.warning(f"Error generating final performance report: {report_error}")
-            logger.info("📊 Basic Final Report: Shutdown completed")
-        
-        logger.info("✅ Graceful shutdown completed")
-        
-    except Exception as e:
-        logger.error(f"Error during shutdown cleanup: {e}")
+
 
 
 if __name__ == '__main__':

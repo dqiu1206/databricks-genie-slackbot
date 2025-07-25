@@ -40,32 +40,26 @@ class Config:
     # Performance settings
     POLL_INTERVAL = 3
     MAX_WAIT_TIME = 120
-    CLEANUP_INTERVAL = 300  # 5 minutes
-    MEMORY_THRESHOLD = 80  # Cleanup when memory usage > 80%
-    
-    # Connection pool
-    POOL_SIZE = 10
-    MAX_POOL_SIZE = 50
-    CONNECTION_TIMEOUT = 30
-    CONNECTION_MAX_AGE = 3600  # 1 hour
-    
-    # Query cache
-    CACHE_SIZE = 1000
-    CACHE_TTL = 1800  # 30 minutes
     
     # Buffer sizes
     BUFFER_SIZE = 1024 * 1024 * 10  # 10MB buffer for large queries
     
-    # Thread pool configuration
-    MAX_WORKER_THREADS = 20
-    WORKER_THREAD_MULTIPLIER = 2  # multiplier for CPU count
-    MIN_CPU_COUNT = 4  # fallback CPU count
+    # Thread pool configuration - optimized for serverless (2 vCPU, 6GB RAM)
+    MAX_WORKER_THREADS = 30  # Increased for better concurrency
+    WORKER_THREAD_MULTIPLIER = 5  # Higher multiplier for 2 vCPU environment
+    MIN_CPU_COUNT = 2  # Match actual vCPU count
     
     # Timing intervals
     HEARTBEAT_INTERVAL = 60  # seconds
     SOCKET_CONNECTION_DELAY = 2  # seconds
-    MESSAGE_PROCESSING_DELAY = 0.5  # seconds
+    MESSAGE_PROCESSING_DELAY = 0.1  # seconds - reduced for faster processing
     PERFORMANCE_UPDATE_INTERVAL = 60  # seconds
+    
+    # Socket Mode connection settings
+    SOCKET_MAX_RETRY_ATTEMPTS = 10
+    SOCKET_BASE_RETRY_DELAY = 5  # seconds
+    SOCKET_MAX_RETRY_DELAY = 300  # 5 minutes
+    SOCKET_HEALTH_CHECK_INTERVAL = 30  # seconds
     
     # Bot response patterns to prevent loops
     BOT_RESPONSE_PATTERNS = [
@@ -75,6 +69,18 @@ class Config:
     
     # System table patterns
     SYSTEM_TABLE_PATTERNS = ['system.billing', 'system.operational_data', 'system.access']
+    
+    # Databricks Genie API limits and best practices
+    GENIE_MAX_CONCURRENT_CONVERSATIONS = 10  # Per workspace limit
+    GENIE_RATE_LIMIT_PER_MINUTE = 60  # Estimated API calls per minute
+    GENIE_MESSAGE_TIMEOUT = 600  # 10 minutes for long-running queries (API guideline)
+    GENIE_POLL_INTERVAL = 7  # Poll every 7 seconds (between 5-10s as recommended)
+    GENIE_BACKOFF_THRESHOLD = 120  # Start exponential backoff after 2 minutes
+    GENIE_MAX_CONVERSATIONS_PER_SPACE = 9000  # Delete conversations before hitting 10k limit
+    
+    # Queue management - optimized for 2 vCPU environment
+    MAX_CONCURRENT_CHANNELS = 5  # Process multiple channels simultaneously
+    CHANNEL_BATCH_SIZE = 3  # Process up to 3 messages per channel concurrently
 
 
 class ConfigurationError(Exception):
@@ -102,12 +108,17 @@ def load_secret(scope: str, key: str, dbutils=None, workspace_client=None) -> Op
 
 def load_configuration(bot_state) -> None:
     """Load configuration from environment variables and secrets."""
+    from .databricks_client import get_databricks_client, initialize_dbutils
+    
     # Check for Databricks Apps environment
     app_databricks_host = os.getenv('DATABRICKS_HOST')
     app_client_id = os.getenv('DATABRICKS_CLIENT_ID')
     app_client_secret = os.getenv('DATABRICKS_CLIENT_SECRET')
     app_access_token = os.getenv('DATABRICKS_ACCESS_TOKEN')
     
+    # Check if running locally (has DATABRICKS_ACCESS_TOKEN in env)
+    is_local_deployment = app_access_token is not None
+    logger.info(f"Local deployment detected: {is_local_deployment}")
     logger.info(f"Databricks Apps environment detected: {app_databricks_host is not None}")
     
     # Check authentication method
@@ -123,29 +134,24 @@ def load_configuration(bot_state) -> None:
     if has_oauth2_credentials and has_access_token:
         logger.warning("Both OAuth2 credentials and Personal Access Token found. Using OAuth2 credentials.")
     
-    # Configure connection pool
-    bot_state.connection_pool.configure(
-        databricks_host=app_databricks_host,
-        client_id=app_client_id,
-        client_secret=app_client_secret,
-        access_token=app_access_token
-    )
+    # Set authentication fields in bot_state
+    bot_state.client_id = app_client_id
+    bot_state.client_secret = app_client_secret
+    bot_state.access_token = app_access_token
     
-    # Initialize workspace client from pool
+    # Initialize workspace client
     if app_databricks_host:
         bot_state.databricks_host = app_databricks_host
         
         try:
-            # Get initial connection to test and configure
-            bot_state.workspace_client = bot_state.connection_pool.get_connection()
+            # Create workspace client to test and configure
+            bot_state.workspace_client = get_databricks_client(bot_state)
             auth_method = "OAuth2 service principal" if has_oauth2_credentials else "Personal Access Token"
             logger.info(f"Successfully authenticated using {auth_method}")
             
-            # Initialize dbutils
-            initialize_dbutils(bot_state.workspace_client, bot_state)
-            
-            # Return connection to pool for reuse
-            bot_state.connection_pool.return_connection(bot_state.workspace_client)
+            # Initialize dbutils only if not running locally
+            if not is_local_deployment:
+                initialize_dbutils(bot_state.workspace_client, bot_state)
             
         except Exception as e:
             logger.error(f"Failed to initialize workspace client: {e}")
@@ -155,9 +161,17 @@ def load_configuration(bot_state) -> None:
     secret_scope = os.getenv('SECRET_SCOPE', 'slackbot-genie')
     bot_state.genie_space_id = os.getenv('GENIE_SPACE_ID')
     
-    # Load Slack tokens
-    bot_state.slack_app_token = load_secret(secret_scope, "SLACK_APP_TOKEN", bot_state.dbutils, bot_state.workspace_client) or os.getenv('SLACK_APP_TOKEN')
-    bot_state.slack_bot_token = load_secret(secret_scope, "SLACK_BOT_TOKEN", bot_state.dbutils, bot_state.workspace_client) or os.getenv('SLACK_BOT_TOKEN')
+    # Load Slack tokens - use environment variables if running locally, otherwise use Databricks secrets
+    if is_local_deployment:
+        # Use environment variables for local deployment
+        bot_state.slack_app_token = os.getenv('SLACK_APP_TOKEN')
+        bot_state.slack_bot_token = os.getenv('SLACK_BOT_TOKEN')
+        logger.info("Using environment variables for Slack tokens (local deployment)")
+    else:
+        # Use Databricks secrets for Databricks Apps deployment
+        bot_state.slack_app_token = load_secret(secret_scope, "SLACK_APP_TOKEN", bot_state.dbutils, bot_state.workspace_client) or os.getenv('SLACK_APP_TOKEN')
+        bot_state.slack_bot_token = load_secret(secret_scope, "SLACK_BOT_TOKEN", bot_state.dbutils, bot_state.workspace_client) or os.getenv('SLACK_BOT_TOKEN')
+        logger.info("Using Databricks secrets for Slack tokens (Databricks Apps deployment)")
     
     # Load SQL query display flag
     show_query_env = os.getenv('SHOW_SQL_QUERY', 'true')
@@ -180,16 +194,4 @@ def validate_environment(bot_state) -> None:
     if missing_vars:
         raise ConfigurationError(f"Missing required configuration values: {', '.join(missing_vars)}")
     
-    logger.info("All required configuration values are set")
-
-
-def initialize_dbutils(workspace_client, bot_state) -> None:
-    """Initialize dbutils with the workspace client for secrets access."""
-    try:
-        if bot_state.dbutils is None and workspace_client is not None:
-            from databricks.sdk.dbutils import RemoteDbUtils
-            bot_state.dbutils = RemoteDbUtils(workspace_client._config)
-            logger.info("Initialized dbutils with workspace client for secrets access")
-    except Exception as e:
-        logger.warning(f"Could not initialize dbutils: {e}")
-        bot_state.dbutils = None 
+    logger.info("All required configuration values are set") 

@@ -1,208 +1,57 @@
 """
 Databricks client module for Genie Slack Bot.
 
-This module handles all Databricks WorkspaceClient interactions, connection pooling,
-and Genie API operations.
+This module handles Databricks WorkspaceClient creation and Genie API operations.
 """
 
 import time
 import logging
 from typing import Optional, List, Dict, Any, Tuple
-from threading import RLock
-from dataclasses import dataclass
-
-
 from databricks.sdk import WorkspaceClient
 from .config import Config, GenieError
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ConnectionMetrics:
-    """Metrics for connection pool performance."""
-    created_count: int = 0
-    reused_count: int = 0
-    closed_count: int = 0
-    failed_count: int = 0
-    current_pool_size: int = 0
-    peak_pool_size: int = 0
-
-
-class DatabricksConnectionPool:
-    """Thread-safe connection pool for Databricks WorkspaceClient."""
-    
-    def __init__(self, max_size: int = Config.POOL_SIZE, timeout: int = Config.CONNECTION_TIMEOUT):
-        self.max_size = max_size
-        self.timeout = timeout
-        self.pool = []
-        self.lock = RLock()
-        self.created_connections = 0
-        self.metrics = ConnectionMetrics()
-        
-        # Connection configuration
-        self.databricks_host = None
-        self.client_id = None
-        self.client_secret = None
-        self.access_token = None
-        
-        # Health check
-        self.last_health_check = time.time()
-        
-    def configure(self, databricks_host: str, client_id: str = None, 
-                 client_secret: str = None, access_token: str = None):
-        """Configure connection pool with authentication details."""
-        self.databricks_host = databricks_host
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.access_token = access_token
-        
-    def _create_connection(self) -> WorkspaceClient:
-        """Create a new WorkspaceClient connection."""
-        try:
-            if self.client_id and self.client_secret:
-                client = WorkspaceClient(
-                    host=self.databricks_host,
-                    client_id=self.client_id,
-                    client_secret=self.client_secret
-                )
-            elif self.access_token:
-                client = WorkspaceClient(
-                    host=self.databricks_host,
-                    token=self.access_token
-                )
-            else:
-                raise ValueError("No valid authentication method configured")
-            
-            # Test the connection
-            client.current_user.me()
-            
-            # Attach metadata
-            client._pool_created_at = time.time()
-            client._pool_last_used = time.time()
-            
-            self.metrics.created_count += 1
-            self.created_connections += 1
-            
-            logger.debug(f"Created new database connection #{self.created_connections}")
-            return client
-            
-        except Exception as e:
-            self.metrics.failed_count += 1
-            logger.error(f"Failed to create database connection: {e}")
-            raise
-    
-    def _is_connection_healthy(self, client: WorkspaceClient) -> bool:
-        """Check if a connection is still healthy."""
-        try:
-            # Check connection age
-            created_at = getattr(client, '_pool_created_at', 0)
-            if time.time() - created_at > Config.CONNECTION_MAX_AGE:
-                return False
-            
-            # Quick health check (only if it's been a while)
-            if time.time() - self.last_health_check > Config.CLEANUP_INTERVAL:
-                client.current_user.me()
-                self.last_health_check = time.time()
-            
-            return True
-        except Exception as e:
-            logger.debug(f"Connection health check failed: {e}")
-            return False
-    
-    def get_connection(self) -> WorkspaceClient:
-        """Get a connection from the pool."""
-        start_time = time.time()
-        
-        with self.lock:
-            # Try to get a healthy connection from pool
-            while self.pool:
-                client = self.pool.pop()
-                if self._is_connection_healthy(client):
-                    client._pool_last_used = time.time()
-                    self.metrics.reused_count += 1
-                    self.metrics.current_pool_size = len(self.pool)
-                    
-                    elapsed = time.time() - start_time
-                    logger.debug(f"Reused pooled connection in {elapsed:.3f}s")
-                    return client
-                else:
-                    # Connection is unhealthy, close it
-                    try:
-                        client._client.close()
-                    except:
-                        pass
-                    self.metrics.closed_count += 1
-            
-            # No healthy connections available, create new one
-            client = self._create_connection()
-            self.metrics.current_pool_size = len(self.pool)
-            self.metrics.peak_pool_size = max(self.metrics.peak_pool_size, self.created_connections)
-            
-            elapsed = time.time() - start_time
-            logger.info(f"Created new connection in {elapsed:.3f}s")
-            return client
-    
-    def return_connection(self, client: WorkspaceClient):
-        """Return a connection to the pool."""
-        if not client:
-            return
-            
-        with self.lock:
-            if len(self.pool) < self.max_size and self._is_connection_healthy(client):
-                self.pool.append(client)
-                self.metrics.current_pool_size = len(self.pool)
-                logger.debug(f"Returned connection to pool (size: {len(self.pool)})")
-            else:
-                # Pool is full or connection unhealthy, close it
-                try:
-                    client._client.close()
-                except:
-                    pass
-                self.metrics.closed_count += 1
-                logger.debug("Closed connection (pool full or unhealthy)")
-    
-    def close_all(self):
-        """Close all connections in the pool."""
-        with self.lock:
-            while self.pool:
-                client = self.pool.pop()
-                try:
-                    client._client.close()
-                except:
-                    pass
-                self.metrics.closed_count += 1
-            logger.info("Closed all pooled connections")
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get connection pool statistics."""
-        with self.lock:
-            return {
-                "pool_size": len(self.pool),
-                "max_size": self.max_size,
-                "created_connections": self.metrics.created_count,
-                "reused_connections": self.metrics.reused_count,
-                "closed_connections": self.metrics.closed_count,
-                "failed_connections": self.metrics.failed_count,
-                "peak_pool_size": self.metrics.peak_pool_size
-            }
-
-
 def get_databricks_client(bot_state) -> WorkspaceClient:
-    """Get a Databricks workspace client from the connection pool."""
+    """Create and return a Databricks workspace client."""
     try:
-        return bot_state.connection_pool.get_connection()
+        # Check if we have OAuth2 credentials
+        if bot_state.client_id and bot_state.client_secret:
+            client = WorkspaceClient(
+                host=bot_state.databricks_host,
+                client_id=bot_state.client_id,
+                client_secret=bot_state.client_secret
+            )
+        elif bot_state.access_token:
+            client = WorkspaceClient(
+                host=bot_state.databricks_host,
+                token=bot_state.access_token
+            )
+        else:
+            raise ValueError("No valid authentication method configured")
+        
+        # Test the connection
+        client.current_user.me()
+        logger.info(f"Successfully connected to Databricks workspace: {bot_state.databricks_host}")
+        
+        return client
+        
     except Exception as e:
-        logger.error(f"Failed to get Databricks client from pool: {e}")
+        logger.error(f"Failed to create Databricks client: {e}")
         raise
 
 
-def return_databricks_client(client: WorkspaceClient, bot_state):
-    """Return a Databricks workspace client to the connection pool."""
+def initialize_dbutils(workspace_client: WorkspaceClient, bot_state) -> None:
+    """Initialize dbutils with the workspace client for secrets access."""
     try:
-        bot_state.connection_pool.return_connection(client)
+        if bot_state.dbutils is None and workspace_client is not None:
+            from databricks.sdk.dbutils import RemoteDbUtils
+            bot_state.dbutils = RemoteDbUtils(workspace_client._config)
+            logger.info("Initialized dbutils with workspace client for secrets access")
     except Exception as e:
-        logger.error(f"Failed to return Databricks client to pool: {e}")
+        logger.warning(f"Could not initialize dbutils: {e}")
+        bot_state.dbutils = None
 
 
 def wait_for_message_completion(workspace_client: WorkspaceClient, space_id: str, conversation_id: str, message_id: str, max_wait_time: int = Config.MAX_WAIT_TIME) -> Any:
