@@ -3,7 +3,7 @@ Ever wonder how you can deploy a Slackbot in Databricks Apps to connect to your 
 
 Well, now you can!
 
-This simple (vibe-coded) app allows you to let your slack users directly query your Databricks Genie Space without ever needing to log in to the Databricks Workspace. You can deploy this locally on your own computer or via Databricks Apps.
+This simple (mostly vibe-coded) app allows you to let your slack users directly query your Databricks Genie Space without ever needing to log in to the Databricks Workspace. You can deploy this locally on your own computer or via Databricks Apps.
 
 Disclaimer: This project is provided as-is for educational and demo purposes only. Please use it at your own risk!
 
@@ -77,7 +77,7 @@ git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
     }
 }
 ```
-5. In the left-hand sidebar under **App Home**, scroll to the bottom and click the box "Allow users to send Slash commands and messages from the messages tab" (optional). This will simply allow you to directly message the bot in a separate tab.
+5. In the left-hand sidebar under **App Home**, scroll to the bottom and click the box "Allow users to send Slash commands and messages from the messages tab". This will simply allow you to directly message the bot in a separate tab.
 
 6. Under **OAuth & Permissions** -> OAuth Tokens, install the app! You should get a token that starts with "xoxb-". This is your SLACK_BOT_TOKEN. Save this as you'll need this later.
 
@@ -159,7 +159,7 @@ databricks apps deploy slackbot-dq --source-code-path xxx
 1. Replace the .env.example file:
 
 ```
-cp .env.example .env
+cp env.example .env
 ```
 
 2. Fill out .env file with correct env variables. You will need to [generate a Personal Access Token (PAT)](https://docs.databricks.com/aws/en/dev-tools/auth/pat) in your Databricks workspace.
