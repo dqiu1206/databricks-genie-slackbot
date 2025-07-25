@@ -198,12 +198,22 @@ In Slack, you can either directly talk to your Slackbot under Apps (at the very 
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the Apache License 2.0 - see the [LICENSE file](LICENSE) for details.
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
-## 🆘 Support
+  
+  
+  
 
-For issues and questions:
-1. Check the troubleshooting section
-2. Review the logs for error details
-3. Open an issue in the repository
-4. Contact your workspace administrator for Databricks-specific issues
+<!-- CONTACT -->
+
+## Contact
+
+  
+
+David Qiu - [LinkedIn](https://www.linkedin.com/in/daviqiu/)
+
+
+  
+
+<p align="right">(<a href="#readme-top">back to top</a>)</p>
