@@ -40,7 +40,7 @@ git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
 1. Sign up with a Slack account (or if using your existing one - make sure you have the necessary permissions to create and install Apps)
 2. Go to api.slack.com -> Your Apps (top right corner)
 3. Create New App -> From a manifest -> Select your Workspace
-4. In the JSON tab, paste the following then click Next -> Create:
+4. In the JSON tab, paste the following, change the name to what you want to name your bot, then click Next -> Create:
 
 ```sh
 {
