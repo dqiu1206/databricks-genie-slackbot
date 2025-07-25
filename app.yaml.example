@@ -1,4 +1,4 @@
-command: ["python", "-m", "databricks_genie_slackbot"]
+command: ["python", "-m", "slackbot"]
 
 # Environment variables
 env:
