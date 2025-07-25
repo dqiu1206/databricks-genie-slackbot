@@ -33,16 +33,12 @@ class Config:
     """Centralized Configuration Constants."""
     
     # Core limits
-    MAX_PROCESSED_MESSAGES = 1000
     MAX_CONVERSATION_AGE = 3600  # 1 hour
     SLACK_FILE_SIZE_LIMIT = 50 * 1024 * 1024  # 50MB
     
     # Performance settings
     POLL_INTERVAL = 3
     MAX_WAIT_TIME = 120
-    
-    # Buffer sizes
-    BUFFER_SIZE = 1024 * 1024 * 10  # 10MB buffer for large queries
     
     # Thread pool configuration - optimized for serverless (2 vCPU, 6GB RAM)
     MAX_WORKER_THREADS = 30  # Increased for better concurrency
@@ -54,12 +50,6 @@ class Config:
     SOCKET_CONNECTION_DELAY = 2  # seconds
     MESSAGE_PROCESSING_DELAY = 0.1  # seconds - reduced for faster processing
     PERFORMANCE_UPDATE_INTERVAL = 60  # seconds
-    
-    # Socket Mode connection settings
-    SOCKET_MAX_RETRY_ATTEMPTS = 10
-    SOCKET_BASE_RETRY_DELAY = 5  # seconds
-    SOCKET_MAX_RETRY_DELAY = 300  # 5 minutes
-    SOCKET_HEALTH_CHECK_INTERVAL = 30  # seconds
     
     # Bot response patterns to prevent loops
     BOT_RESPONSE_PATTERNS = [
@@ -76,11 +66,9 @@ class Config:
     GENIE_MESSAGE_TIMEOUT = 600  # 10 minutes for long-running queries (API guideline)
     GENIE_POLL_INTERVAL = 7  # Poll every 7 seconds (between 5-10s as recommended)
     GENIE_BACKOFF_THRESHOLD = 120  # Start exponential backoff after 2 minutes
-    GENIE_MAX_CONVERSATIONS_PER_SPACE = 9000  # Delete conversations before hitting 10k limit
     
     # Queue management - optimized for 2 vCPU environment
     MAX_CONCURRENT_CHANNELS = 5  # Process multiple channels simultaneously
-    CHANNEL_BATCH_SIZE = 3  # Process up to 3 messages per channel concurrently
 
 
 class ConfigurationError(Exception):

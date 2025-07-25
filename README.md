@@ -19,6 +19,9 @@ A **Databricks Genie Space** is a shared workspace where teams can use AI-powere
 - Query results should return as a CSV file directly inside of your message
 - Messages within a single thread are tracked as a distinct "conversation" in Genie
 - Uses Websockets for connection (I chose this mostly due to enterprise security limitations with allowing HTTP connections into their workspace)
+- **Performance Optimized**: Implements Databricks Genie API best practices with rate limiting, exponential backoff, and optimized polling
+- **Concurrent Processing**: Supports multiple channels and users simultaneously with intelligent queuing
+- **Resource Efficient**: Optimized for serverless environments (2 vCPU, 6GB RAM)
 
 ## Limitations
 - Right now, since it is using the Databricks Apps Oauth permissions, you cannot view the history of your queries in the Databricks UI.
@@ -173,7 +176,7 @@ pip install -r requirements.txt
 4. Deploy the app
 
 ```
-python -m databricks_genie_slackbot
+python app.py
 ```
 
 #### Congrats! Now, you should be able to message your Slackbot in Slack.

@@ -1435,20 +1435,15 @@ def main() -> None:
                     # Get performance metrics
                     try:
                         performance_metrics = bot_state.performance_monitor.get_metrics()
-                        # connection_stats = bot_state.connection_pool.get_stats() # Removed as per edit hint
                         
                         logger.info(f"💓 Enhanced Heartbeat - Time: {datetime.now().isoformat()}")
                         logger.info(f"   📊 Performance - Avg Response: {performance_metrics.get('avg_response_time', 0):.2f}s, "
                                   f"Memory: {performance_metrics.get('memory_usage_mb', 0):.1f}MB, "
                                   f"Queries: {performance_metrics.get('query_count', 0)}")
-                        # logger.info(f"   🔗 Connections - Pool: {connection_stats.get('pool_size', 0)}/{connection_stats.get('max_size', 0)}, " # Removed as per edit hint
-                        #           f"Created: {connection_stats.get('created_connections', 0)}, " # Removed as per edit hint
-                        #           f"Reused: {connection_stats.get('reused_connections', 0)}") # Removed as per edit hint
                         logger.info(f"   📨 Queue - Active: {active_queues}, "
                                   f"Messages: {total_queued_messages}, "
                                   f"Processing: {len(bot_state.processing_channels)}")
                         logger.info(f"   💬 Conversations: {len(bot_state.conversation_tracker)}")
-                        
 
                     except Exception as heartbeat_error:
                         logger.error(f"Error in enhanced heartbeat metrics: {heartbeat_error}")
