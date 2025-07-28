@@ -48,27 +48,46 @@ git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
 ```sh
 {
     "display_information": {
-        "name": "Databricks Genie"
+        "name": "Genie"
     },
     "features": {
+        "app_home": {
+            "home_tab_enabled": true,
+            "messages_tab_enabled": true,
+            "messages_tab_read_only_enabled": false
+        },
         "bot_user": {
-            "display_name": "Databricks Genie",
-            "always_online": true
+            "display_name": "Genie",
+            "always_online": false
         }
     },
     "oauth_config": {
         "scopes": {
             "bot": [
                 "app_mentions:read",
+                "channels:history",
+                "channels:read",
                 "chat:write",
-                "files:write"
+                "files:read",
+                "files:write",
+                "groups:history",
+                "groups:read",
+                "im:history",
+                "im:read",
+                "im:write",
+                "mpim:history",
+                "mpim:read"
             ]
         }
     },
     "settings": {
         "event_subscriptions": {
             "bot_events": [
-                "app_mention"
+                "app_mention",
+                "message.channels",
+                "message.groups",
+                "message.im",
+                "message.mpim"
             ]
         },
         "interactivity": {
