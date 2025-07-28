@@ -159,7 +159,7 @@ databricks apps deploy slackbot-dq --source-code-path xxx
 
 ## Deploying Locally
 
-1. Replace the .env.example file:
+1. Create your env file:
 
 ```
 cp env.example .env
@@ -167,7 +167,13 @@ cp env.example .env
 
 2. Fill out .env file with correct env variables. You will need to [generate a Personal Access Token (PAT)](https://docs.databricks.com/aws/en/dev-tools/auth/pat) in your Databricks workspace.
 
-3. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
+3. Create your app deployment file (app.yaml):
+
+```
+cp app.yaml.example app.yaml
+```
+
+4. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
 
 ```
 pip install -r requirements.txt
