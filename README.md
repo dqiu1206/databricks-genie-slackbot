@@ -160,7 +160,14 @@ env:
 #### Create your Databricks App
 
 1. Follow this [guide](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/create-custom-app) to setup your App
-2. After it gets deployed, go to the parent directory of the app in the terminal and paste in the following 2 commands:
+
+2. Create your app deployment file (app.yaml). Fill it out with your secrets scope name and Genie Space ID:
+
+```
+cp app.yaml.example app.yaml
+```
+
+3. After it gets deployed, go to the parent directory of the app in the terminal and paste in the following 2 commands:
 
 Sync source files - you can copy this is in your Overview tab
 
@@ -186,13 +193,7 @@ cp env.example .env
 
 2. Fill out .env file with correct env variables. You will need to [generate a Personal Access Token (PAT)](https://docs.databricks.com/aws/en/dev-tools/auth/pat) in your Databricks workspace.
 
-3. Create your app deployment file (app.yaml):
-
-```
-cp app.yaml.example app.yaml
-```
-
-4. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
+3. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
 
 ```
 pip install -r requirements.txt
