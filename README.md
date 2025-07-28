@@ -30,7 +30,7 @@ A **Databricks Genie Space** is a shared workspace where teams can use AI-powere
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 # Getting Started
-For this project, you will need to first set up a Slackbot (duh). Then, deploy the slackbot either to your own local computer or Databricks Apps.
+For this project, you will need to first set up a Slackbot. Then, deploy the slackbot either to your own local computer or Databricks Apps.
 
 First clone this repository:
 
