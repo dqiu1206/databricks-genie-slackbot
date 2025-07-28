@@ -1,4 +1,4 @@
-# About
+# Databricks Genie Slackbot
 Ever wonder how you can deploy a Slackbot in Databricks Apps to connect to your Genie Space?
 
 Well, now you can!
