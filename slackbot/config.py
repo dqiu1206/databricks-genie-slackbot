@@ -51,6 +51,12 @@ class Config:
     MESSAGE_PROCESSING_DELAY = 0.1  # seconds - reduced for faster processing
     PERFORMANCE_UPDATE_INTERVAL = 60  # seconds
     
+    # Socket Mode connection settings
+    SOCKET_MAX_RETRY_ATTEMPTS = 10
+    SOCKET_BASE_RETRY_DELAY = 5  # seconds
+    SOCKET_MAX_RETRY_DELAY = 300  # 5 minutes
+    SOCKET_HEALTH_CHECK_INTERVAL = 30  # seconds
+    
     # Bot response patterns to prevent loops
     BOT_RESPONSE_PATTERNS = [
         "Genie:", "✅", "❌", "📁", "🔗", "📊", "⏱️", "📋", 
