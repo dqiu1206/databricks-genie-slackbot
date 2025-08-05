@@ -710,7 +710,21 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
                 conversation_id=conversation_id,
                 content=msg_input
             )
-            message_id = getattr(conv_response, 'id', None) or getattr(conv_response, 'message_id', None)
+            
+            # Check if response is valid
+            if not conv_response:
+                logger.error(f"Received None response from create_message for conversation {conversation_id}")
+                return "Error: Failed to create message in conversation.", None, None, conversation_id
+            
+            # Use safe extraction for message ID in continued conversations
+            from .databricks_client import safe_getattr, safe_extract_id
+            message = safe_getattr(conv_response, 'message')
+            message_id = safe_getattr(message, 'id') if message else None
+            if not message_id:
+                message_id = safe_extract_id(conv_response, ['id', 'message_id'])
+            
+            # Log the extracted message ID for debugging
+            logger.info(f"Extracted message_id: {message_id} for conversation: {conversation_id}")
             conv_id = conversation_id
         else:
             logger.info("Starting new conversation")
@@ -722,8 +736,13 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
             conv_id, message_id = extract_conversation_ids(conv_response)
         
         if not conv_id or not message_id:
-            logger.error(f"Missing conversation_id or message_id in response")
-            return "Error: Could not retrieve conversation details from Genie's response.", None, None, conv_id
+            logger.error(f"Missing conversation_id ({conv_id}) or message_id ({message_id}) in response")
+            if conversation_id:
+                # This was a continued conversation, so we know the conv_id
+                return f"Error: Could not retrieve message ID from Genie's response for conversation {conv_id}.", None, None, conv_id
+            else:
+                # This was a new conversation
+                return "Error: Could not retrieve conversation details from Genie's response.", None, None, conv_id
 
         # Wait for message completion with improved polling (5-10s intervals)
         message_result = wait_for_message_completion_with_backoff(
