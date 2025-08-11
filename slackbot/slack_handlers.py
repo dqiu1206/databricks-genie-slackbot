@@ -166,18 +166,15 @@ def setup_slack_handlers(bot_state) -> None:
             logger.info("👋 Socket Mode connected successfully - received hello event")
         
         def process_message(event: Dict[str, Any], say, client) -> None:
-            """Add message to channel queue for sequential processing."""
+            """Add message to user queue for sequential processing per user."""
+            user_id = event.get("user", "unknown_user")
             channel_id = event.get("channel", "unknown_channel")
             thread_ts = event.get('thread_ts')
             
-            # For threaded messages, process immediately (each thread has its own conversation)
-            if thread_ts:
-                logger.debug(f"Processing threaded message immediately for channel {channel_id}, thread {thread_ts}")
-                bot_state.message_executor.submit(process_message_async, event, say, client, bot_state)
-            else:
-                # For non-threaded messages, add to queue for sequential processing
-                logger.debug(f"Adding non-threaded message to queue for channel {channel_id}")
-                add_message_to_queue(channel_id, event, say, client, bot_state)
+            # All messages are now queued per user regardless of thread status
+            # This ensures each user is limited to 1 thread across all conversations
+            logger.debug(f"Adding message to queue for user {user_id} in channel {channel_id}")
+            add_message_to_queue(user_id, event, say, client, bot_state)
         
         @bot_state.slack_app.event("message")
         def handle_message(event: Dict[str, Any], say) -> None:

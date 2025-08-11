@@ -73,8 +73,9 @@ class Config:
     GENIE_POLL_INTERVAL = 7  # Poll every 7 seconds (between 5-10s as recommended)
     GENIE_BACKOFF_THRESHOLD = 120  # Start exponential backoff after 2 minutes
     
-    # Queue management - optimized for 2 vCPU environment
-    MAX_CONCURRENT_CHANNELS = 5  # Process multiple channels simultaneously
+    # User-based concurrency management - optimized for 2 vCPU environment
+    MAX_CONCURRENT_USERS = 15  # Maximum users processing simultaneously
+    MAX_THREADS_PER_USER = 1  # Each user limited to 1 thread across all conversations
 
 
 class ConfigurationError(Exception):

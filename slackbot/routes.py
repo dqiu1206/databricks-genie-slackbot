@@ -85,9 +85,9 @@ def status():
     """Get detailed status of the service with performance metrics."""
     from .utils import bot_state
     
-    # Calculate queue statistics
+    # Calculate user-based queue statistics
     total_queued_messages = sum(len(queue) for queue in bot_state.message_queue.values())
-    active_queues = len([q for q in bot_state.message_queue.values() if q])
+    active_user_queues = len([q for q in bot_state.message_queue.values() if q])
     
     # Get performance metrics
     performance_metrics = bot_state.performance_monitor.get_metrics()
@@ -106,11 +106,13 @@ def status():
             'max_conversation_age_seconds': Config.MAX_CONVERSATION_AGE
         },
         'queue_stats': {
-            'processing_channels': len(bot_state.processing_channels),
-            'active_queues': active_queues,
+            'processing_users': len(bot_state.processing_users),
+            'active_user_queues': active_user_queues,
             'total_queued_messages': total_queued_messages,
-            'queue_details': {
-                channel_id: len(queue) for channel_id, queue in bot_state.message_queue.items() if queue
+            'max_concurrent_users': Config.MAX_CONCURRENT_USERS,
+            'max_threads_per_user': Config.MAX_THREADS_PER_USER,
+            'user_queue_details': {
+                user_id: len(queue) for user_id, queue in bot_state.message_queue.items() if queue
             }
         },
         'performance': {

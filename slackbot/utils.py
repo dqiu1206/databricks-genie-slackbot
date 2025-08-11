@@ -146,10 +146,10 @@ class BotState:
         self.conversation_tracker = {}
         self.conversation_timestamps = {}
         
-        # Message queuing for handling concurrent messages
-        self.message_queue = {}  # channel_id -> queue of pending messages
-        self.queue_locks = {}  # channel_id -> lock for queue operations
-        self.processing_channels = set()  # channels currently being processed
+        # User-based message queuing for handling concurrent messages
+        self.message_queue = {}  # user_id -> queue of pending messages
+        self.queue_locks = {}  # user_id -> lock for queue operations
+        self.processing_users = set()  # users currently being processed
         
         # Locks
         self.processed_messages_lock = RLock()
@@ -325,26 +325,26 @@ def store_conversation_id(channel_id: str, thread_ts: Optional[str], conversatio
 
 
 
-def get_channel_queue_lock(channel_id: str, bot_state) -> RLock:
-    """Get or create a lock for a specific channel's message queue."""
+def get_user_queue_lock(user_id: str, bot_state) -> RLock:
+    """Get or create a lock for a specific user's message queue."""
     with bot_state.queue_lock:
-        if channel_id not in bot_state.queue_locks:
-            bot_state.queue_locks[channel_id] = RLock()
-        return bot_state.queue_locks[channel_id]
+        if user_id not in bot_state.queue_locks:
+            bot_state.queue_locks[user_id] = RLock()
+        return bot_state.queue_locks[user_id]
 
 
-def add_message_to_queue(channel_id: str, event: Dict[str, Any], say, client, bot_state) -> None:
-    """Add a message to the channel's processing queue."""
-    channel_lock = get_channel_queue_lock(channel_id, bot_state)
+def add_message_to_queue(user_id: str, event: Dict[str, Any], say, client, bot_state) -> None:
+    """Add a message to the user's processing queue."""
+    user_lock = get_user_queue_lock(user_id, bot_state)
     
-    with channel_lock:
-        if channel_id not in bot_state.message_queue:
-            bot_state.message_queue[channel_id] = []
+    with user_lock:
+        if user_id not in bot_state.message_queue:
+            bot_state.message_queue[user_id] = []
         
         # Add message to queue
-        bot_state.message_queue[channel_id].append((event, say, client))
-        queue_length = len(bot_state.message_queue[channel_id])
-        logger.info(f"📥 Added message to queue for channel {channel_id}. Queue length: {queue_length}")
+        bot_state.message_queue[user_id].append((event, say, client))
+        queue_length = len(bot_state.message_queue[user_id])
+        logger.info(f"📥 Added message to queue for user {user_id}. Queue length: {queue_length}")
         
         # Only show queue message if queue is getting long (more than 3 messages)
         if queue_length > 3:
@@ -354,28 +354,32 @@ def add_message_to_queue(channel_id: str, event: Dict[str, Any], say, client, bo
             except Exception as e:
                 logger.error(f"Error sending queue status message: {e}")
         
-        # Start processing if not already processing OR if we have capacity
-        active_channels = len(bot_state.processing_channels)
-        if channel_id not in bot_state.processing_channels and active_channels < Config.MAX_CONCURRENT_CHANNELS:
-            bot_state.processing_channels.add(channel_id)
+        # Start processing if not already processing AND if we have capacity AND user isn't at thread limit
+        active_users = len(bot_state.processing_users)
+        user_thread_count = 1 if user_id in bot_state.processing_users else 0
+        
+        if (user_id not in bot_state.processing_users and 
+            active_users < Config.MAX_CONCURRENT_USERS and 
+            user_thread_count < Config.MAX_THREADS_PER_USER):
+            bot_state.processing_users.add(user_id)
             # Submit queue processing to thread pool
-            bot_state.message_executor.submit(process_channel_queue, channel_id, bot_state)
+            bot_state.message_executor.submit(process_user_queue, user_id, bot_state)
 
 
-def process_channel_queue(channel_id: str, bot_state) -> None:
-    """Process all messages in a channel's queue sequentially."""
-    channel_lock = get_channel_queue_lock(channel_id, bot_state)
+def process_user_queue(user_id: str, bot_state) -> None:
+    """Process all messages in a user's queue sequentially."""
+    user_lock = get_user_queue_lock(user_id, bot_state)
     
     try:
         while True:
-            with channel_lock:
-                if not bot_state.message_queue.get(channel_id):
+            with user_lock:
+                if not bot_state.message_queue.get(user_id):
                     # No more messages in queue
                     break
                 
                 # Get next message from queue
-                event, say, client = bot_state.message_queue[channel_id].pop(0)
-                logger.info(f"📤 Processing message from queue for channel {channel_id}. Remaining in queue: {len(bot_state.message_queue[channel_id])}")
+                event, say, client = bot_state.message_queue[user_id].pop(0)
+                logger.info(f"📤 Processing message from queue for user {user_id}. Remaining in queue: {len(bot_state.message_queue[user_id])}")
             
             # Process the message (outside the lock to avoid blocking)
             try:
@@ -383,7 +387,7 @@ def process_channel_queue(channel_id: str, bot_state) -> None:
                 # Small delay between messages to prevent overwhelming the system
                 time.sleep(Config.MESSAGE_PROCESSING_DELAY)
             except Exception as e:
-                logger.error(f"Error processing queued message for channel {channel_id}: {e}")
+                logger.error(f"Error processing queued message for user {user_id}: {e}")
                 # Send error response
                 try:
                     say(f"❌ Sorry, I encountered an error processing your message: {str(e)}", thread_ts=event.get("ts"))
@@ -391,10 +395,10 @@ def process_channel_queue(channel_id: str, bot_state) -> None:
                     logger.error(f"Error sending error message: {say_error}")
     
     finally:
-        # Remove channel from processing set
+        # Remove user from processing set
         with bot_state.queue_lock:
-            bot_state.processing_channels.discard(channel_id)
-        logger.info(f"✅ Finished processing queue for channel {channel_id}")
+            bot_state.processing_users.discard(user_id)
+        logger.info(f"✅ Finished processing queue for user {user_id}")
 
 
 def is_bot_message(event: Dict[str, Any], bot_state) -> bool:
@@ -1447,9 +1451,9 @@ def main() -> None:
                 try:
                     current_time = time.time()
                     
-                    # Calculate queue statistics
+                    # Calculate user-based queue statistics
                     total_queued_messages = sum(len(queue) for queue in bot_state.message_queue.values())
-                    active_queues = len([q for q in bot_state.message_queue.values() if q])
+                    active_user_queues = len([q for q in bot_state.message_queue.values() if q])
                     
                     # Get performance metrics
                     try:
@@ -1459,9 +1463,9 @@ def main() -> None:
                         logger.info(f"   📊 Performance - Avg Response: {performance_metrics.get('avg_response_time', 0):.2f}s, "
                                   f"Memory: {performance_metrics.get('memory_usage_mb', 0):.1f}MB, "
                                   f"Queries: {performance_metrics.get('query_count', 0)}")
-                        logger.info(f"   📨 Queue - Active: {active_queues}, "
+                        logger.info(f"   📨 Queue - Active Users: {active_user_queues}, "
                                   f"Messages: {total_queued_messages}, "
-                                  f"Processing: {len(bot_state.processing_channels)}")
+                                  f"Processing Users: {len(bot_state.processing_users)}")
                         logger.info(f"   💬 Conversations: {len(bot_state.conversation_tracker)}")
 
                     except Exception as heartbeat_error:
@@ -1469,7 +1473,7 @@ def main() -> None:
                         # Basic heartbeat fallback
                         logger.info(f"💓 Basic Heartbeat - Time: {datetime.now().isoformat()}, "
                                   f"Conversations: {len(bot_state.conversation_tracker)}, "
-                                  f"Processing: {len(bot_state.processing_channels)}")
+                                  f"Processing Users: {len(bot_state.processing_users)}")
                     
                     time.sleep(Config.HEARTBEAT_INTERVAL)  # Heartbeat every minute
                 except Exception as e:
