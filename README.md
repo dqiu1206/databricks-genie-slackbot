@@ -65,18 +65,13 @@ git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
         "scopes": {
             "bot": [
                 "app_mentions:read",
-                "channels:history",
                 "channels:read",
                 "chat:write",
                 "files:read",
                 "files:write",
-                "groups:history",
-                "groups:read",
                 "im:history",
                 "im:read",
-                "im:write",
-                "mpim:history",
-                "mpim:read"
+                "im:write"
             ]
         }
     },
@@ -84,10 +79,7 @@ git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.channels",
-                "message.groups",
-                "message.im",
-                "message.mpim"
+                "message.im"
             ]
         },
         "interactivity": {

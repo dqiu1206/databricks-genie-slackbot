@@ -178,7 +178,7 @@ def setup_slack_handlers(bot_state) -> None:
         
         @bot_state.slack_app.event("message")
         def handle_message(event: Dict[str, Any], say) -> None:
-            """Handle all messages including channel messages, direct messages, and group messages."""
+            """Handle direct messages only. Channel messages require explicit mentions."""
             logger.info(f"📨 Received message event: {event.get('type', 'unknown')}, channel: {event.get('channel', 'unknown')}, user: {event.get('user', 'unknown')}, text: {event.get('text', '')[:50]}")
             
             # Get channel information
@@ -195,40 +195,38 @@ def setup_slack_handlers(bot_state) -> None:
                 logger.debug("Ignoring message from bot itself")
                 return
             
-            # Check if we can process this message
-            if bot_state.slack_app and bot_state.slack_app.client:
-                # Check channel type and permissions
-                channel_info = get_channel_info(bot_state.slack_app.client, channel_id)
-                
-                if channel_info:
-                    channel_type = "private" if channel_info.get('is_private', False) else "public"
-                    channel_name = channel_info.get('name', 'unknown')
-                    logger.debug(f"Processing message in {channel_type} channel: #{channel_name} ({channel_id})")
-                    
-                    # Check if bot can post to this channel
-                    if can_bot_post_to_channel(bot_state.slack_app.client, channel_id):
-                        process_message(event, say, bot_state.slack_app.client)
-                    else:
-                        logger.warning(f"Bot cannot post to channel {channel_id} - may need to be invited")
-                        # Try to invite bot to channel
-                        if invite_bot_to_channel(bot_state.slack_app.client, channel_id):
-                            # Retry processing after successful invite
-                            process_message(event, say, bot_state.slack_app.client)
-                        else:
-                            logger.error(f"Failed to invite bot to channel {channel_id} - message will not be processed")
-                else:
-                    # For direct messages or channels we can't get info for, process anyway
-                    if channel_id.startswith("D"):  # Direct message
-                        logger.debug(f"Processing direct message in channel {channel_id}")
-                        process_message(event, say, bot_state.slack_app.client)
-                    else:
-                        logger.warning(f"Could not get channel info for {channel_id} - attempting to process anyway")
-                        process_message(event, say, bot_state.slack_app.client)
+            # Only process direct messages (DMs) - channel messages require explicit mentions
+            if channel_id.startswith("D"):  # Direct message
+                logger.debug(f"Processing direct message in channel {channel_id}")
+                if bot_state.slack_app and bot_state.slack_app.client:
+                    process_message(event, say, bot_state.slack_app.client)
+            else:
+                # For channel messages, ignore them - they should be handled by app_mention event
+                logger.debug(f"Ignoring channel message in {channel_id} - requires explicit mention (@bot)")
+                return
 
         @bot_state.slack_app.event("app_mention")
         def handle_app_mention(event: Dict[str, Any], say) -> None:
-            """Handle app mentions (@botname) in channels."""
-            logger.info(f"📨 Received app_mention event: {event.get('type', 'unknown')}, channel: {event.get('channel', 'unknown')}, user: {event.get('user', 'unknown')}")
+            """Handle app mentions (@botname) in channels and threads."""
+            channel_id = event.get("channel", "unknown")
+            user_id = event.get("user", "unknown")
+            thread_ts = event.get("thread_ts")
+            message_text = event.get("text", "")
+            
+            thread_info = f" in thread {thread_ts}" if thread_ts else ""
+            logger.info(f"📨 Received app_mention event: channel: {channel_id}, user: {user_id}{thread_info}")
+            logger.info(f"   Mention text: {message_text[:100]}...")
+            
+            # Skip bot messages to prevent loops
+            if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
+                logger.debug("Ignoring bot mention in bot message to prevent loops")
+                return
+            
+            # Skip messages from the bot itself
+            if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
+                logger.debug("Ignoring mention from bot itself")
+                return
+            
             if bot_state.slack_app and bot_state.slack_app.client:
                 process_message(event, say, bot_state.slack_app.client)
         
@@ -258,7 +256,7 @@ def setup_slack_handlers(bot_state) -> None:
                 logger.warning(f"🔍 Unhandled event type: {event_type}, event: {event}")
         
         logger.info("✅ Slack event handlers registered successfully")
-        logger.info("📡 Registered event handlers: message, app_mention, channel_joined, group_joined, hello")
+        logger.info("📡 Registered event handlers: message (DM only), app_mention (channels/threads), channel_joined, group_joined, hello")
     else:
         logger.error("❌ Cannot set up Slack handlers - slack_app is None")
 
