@@ -276,17 +276,10 @@ def execute_query_with_fallback(workspace_client: WorkspaceClient, space_id: str
             if warehouse_id:
                 logger.info(f"Using warehouse ID: {warehouse_id}")
                 
-                # Check if this is a system table query
-                query_text = query_attachment.query.lower()
-                is_system_query = any(table in query_text for table in Config.SYSTEM_TABLE_PATTERNS)
-                
-                if is_system_query:
-                    logger.info("Detected system table query - this may require special permissions")
-                
                 query_result = workspace_client.statement_execution.execute_statement(
                     warehouse_id=warehouse_id,
                     statement=query_attachment.query,
-                    wait_timeout="120s" if is_system_query else "60s"
+                    wait_timeout="900s"  # 15 minutes to match Genie's timeout
                 )
                 logger.info("Successfully executed query directly")
                 return query_result

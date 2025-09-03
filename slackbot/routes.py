@@ -109,8 +109,7 @@ def status():
             'processing_users': len(bot_state.processing_users),
             'active_user_queues': active_user_queues,
             'total_queued_messages': total_queued_messages,
-            'max_concurrent_users': Config.MAX_CONCURRENT_USERS,
-            'max_threads_per_user': Config.MAX_THREADS_PER_USER,
+            'note': 'No user-based limits - only workspace QPM limits apply',
             'user_queue_details': {
                 user_id: len(queue) for user_id, queue in bot_state.message_queue.items() if queue
             }

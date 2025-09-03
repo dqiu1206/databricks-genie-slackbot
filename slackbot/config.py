@@ -32,30 +32,24 @@ except ImportError:
 class Config:
     """Centralized Configuration Constants."""
     
-    # Core limits
+    # Core application limits
     MAX_CONVERSATION_AGE = 3600  # 1 hour
     SLACK_FILE_SIZE_LIMIT = 50 * 1024 * 1024  # 50MB
     
-    # Performance settings
-    POLL_INTERVAL = 3
-    MAX_WAIT_TIME = 120
+    # Databricks client polling settings
+    POLL_INTERVAL = 3  # seconds between polls
+    MAX_WAIT_TIME = 120  # maximum wait time for operations
     
-    # Thread pool configuration - optimized for serverless (2 vCPU, 6GB RAM)
-    MAX_WORKER_THREADS = 30  # Increased for better concurrency
-    WORKER_THREAD_MULTIPLIER = 5  # Higher multiplier for 2 vCPU environment
-    MIN_CPU_COUNT = 2  # Match actual vCPU count
+    # Thread pool configuration
+    MAX_WORKER_THREADS = 30
+    WORKER_THREAD_MULTIPLIER = 5
+    MIN_CPU_COUNT = 2
     
-    # Timing intervals
+    # System timing intervals
     HEARTBEAT_INTERVAL = 60  # seconds
     SOCKET_CONNECTION_DELAY = 2  # seconds
-    MESSAGE_PROCESSING_DELAY = 0.1  # seconds - reduced for faster processing
+    MESSAGE_PROCESSING_DELAY = 0.1  # seconds
     PERFORMANCE_UPDATE_INTERVAL = 60  # seconds
-    
-    # Socket Mode connection settings
-    SOCKET_MAX_RETRY_ATTEMPTS = 10
-    SOCKET_BASE_RETRY_DELAY = 5  # seconds
-    SOCKET_MAX_RETRY_DELAY = 300  # 5 minutes
-    SOCKET_HEALTH_CHECK_INTERVAL = 30  # seconds
     
     # Bot response patterns to prevent loops
     BOT_RESPONSE_PATTERNS = [
@@ -63,19 +57,22 @@ class Config:
         "💾", "📦", "🆔", "⚠️", "Query generated but could not be executed automatically"
     ]
     
-    # System table patterns
-    SYSTEM_TABLE_PATTERNS = ['system.billing', 'system.operational_data', 'system.access']
     
-    # Databricks Genie API limits and best practices
+    # Databricks Genie API limits (aligned with documentation: 5 QPM for API usage)
     GENIE_MAX_CONCURRENT_CONVERSATIONS = 10  # Per workspace limit
-    GENIE_RATE_LIMIT_PER_MINUTE = 60  # Estimated API calls per minute
-    GENIE_MESSAGE_TIMEOUT = 600  # 10 minutes for long-running queries (API guideline)
+    GENIE_RATE_LIMIT_PER_MINUTE = 5  # 5 QPM per workspace (API usage, as documented)
+    GENIE_BURST_CAPACITY = 0  # No burst capacity - strict 5 QPM limit to match Genie API
+    GENIE_MESSAGE_TIMEOUT = 600  # 10 minutes for long-running queries
     GENIE_POLL_INTERVAL = 7  # Poll every 7 seconds (between 5-10s as recommended)
     GENIE_BACKOFF_THRESHOLD = 120  # Start exponential backoff after 2 minutes
     
-    # User-based concurrency management - optimized for 2 vCPU environment
-    MAX_CONCURRENT_USERS = 15  # Maximum users processing simultaneously
-    MAX_THREADS_PER_USER = 1  # Each user limited to 1 thread across all conversations
+    # Enhanced throttling system configuration
+    GENIE_QUEUE_MAX_SIZE = 50  # Maximum number of queued requests per workspace
+    GENIE_QUEUE_TIMEOUT = 300  # 5 minutes max wait time in queue
+    GENIE_RATE_LIMIT_WINDOW_SIZE = 60  # Sliding window size in seconds
+    GENIE_THROTTLE_CHECK_INTERVAL = 1  # Check rate limits every second
+    
+    # No user-based concurrency limits - only workspace QPM limits apply
 
 
 class ConfigurationError(Exception):
@@ -85,6 +82,11 @@ class ConfigurationError(Exception):
 
 class GenieError(Exception):
     """Raised when Genie operations fail."""
+    pass
+
+
+class GenieRateLimitExceeded(GenieError):
+    """Raised when Genie API returns rate limiting errors."""
     pass
 
 
@@ -189,4 +191,4 @@ def validate_environment(bot_state) -> None:
     if missing_vars:
         raise ConfigurationError(f"Missing required configuration values: {', '.join(missing_vars)}")
     
-    logger.info("All required configuration values are set") 
+    logger.info("All required configuration values are set")

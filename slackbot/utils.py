@@ -19,6 +19,8 @@ from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from dataclasses import dataclass, field
+from collections import deque
+from enum import Enum
 
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.errors import (
@@ -26,7 +28,7 @@ from databricks.sdk.errors import (
     InternalError, TooManyRequests
 )
 
-from .config import Config, GenieError
+from .config import Config, GenieError, GenieRateLimitExceeded
 from .databricks_client import (
     get_databricks_client, initialize_dbutils, extract_conversation_ids,
     wait_for_message_completion, execute_query_with_fallback, 
@@ -116,6 +118,397 @@ class PerformanceMonitor:
             }
 
 
+class ThrottleStatus(Enum):
+    """Status of throttling operations."""
+    ALLOWED = "allowed"
+    RATE_LIMITED = "rate_limited"
+    QUEUED = "queued"
+    QUEUE_FULL = "queue_full"
+    TIMED_OUT = "timed_out"
+
+
+@dataclass
+class QueuedRequest:
+    """Represents a queued request with metadata."""
+    request_id: str
+    user_id: str
+    timestamp: float
+    priority: int = 0
+    timeout: float = 300  # 5 minutes default
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ThrottleMetrics:
+    """Enhanced metrics for throttling operations."""
+    total_requests: int = 0
+    allowed_requests: int = 0
+    rate_limited_requests: int = 0
+    queued_requests: int = 0
+    queue_full_rejections: int = 0
+    queue_timeouts: int = 0
+    current_queue_depth: int = 0
+    avg_queue_wait_time: float = 0.0
+    rate_limit_utilization: float = 0.0
+    last_updated: datetime = field(default_factory=datetime.now)
+
+
+class GenieRateLimiter:
+    """Sliding window rate limiter for Genie API calls."""
+    
+    def __init__(self, rate_limit_per_minute: int = Config.GENIE_RATE_LIMIT_PER_MINUTE,
+                 window_size: int = Config.GENIE_RATE_LIMIT_WINDOW_SIZE,
+                 burst_capacity: int = Config.GENIE_BURST_CAPACITY):
+        self.rate_limit = rate_limit_per_minute
+        self.window_size = window_size
+        self.burst_capacity = burst_capacity
+        self.requests = deque()
+        self.lock = RLock()
+        
+        logger.info(f"Initialized GenieRateLimiter: {rate_limit_per_minute} QPM, {window_size}s window, {burst_capacity} burst capacity")
+    
+    def can_proceed(self) -> bool:
+        """Check if a request can proceed without violating rate limits."""
+        with self.lock:
+            current_time = time.time()
+            self._cleanup_old_requests(current_time)
+            
+            # Check if we're under the rate limit
+            current_count = len(self.requests)
+            if current_count < self.rate_limit:
+                return True
+            
+            # Check if we can use burst capacity
+            if current_count < self.rate_limit + self.burst_capacity:
+                # Allow burst if the rate over the last 30 seconds is reasonable
+                recent_count = sum(1 for req_time in self.requests 
+                                 if current_time - req_time <= 30)
+                if recent_count < self.rate_limit // 2:
+                    return True
+            
+            return False
+    
+    def record_request(self) -> bool:
+        """Record a request if it's allowed by rate limits."""
+        with self.lock:
+            if self.can_proceed():
+                self.requests.append(time.time())
+                return True
+            return False
+    
+    def get_utilization(self) -> float:
+        """Get current rate limit utilization as a percentage."""
+        with self.lock:
+            current_time = time.time()
+            self._cleanup_old_requests(current_time)
+            return min((len(self.requests) / self.rate_limit) * 100, 100.0)
+    
+    def get_time_until_next_slot(self) -> float:
+        """Get estimated time until next request slot is available."""
+        with self.lock:
+            if self.can_proceed():
+                return 0.0
+            
+            if not self.requests:
+                return 0.0
+            
+            # Time until oldest request expires
+            oldest_request = self.requests[0]
+            return max(0.0, self.window_size - (time.time() - oldest_request))
+    
+    def _cleanup_old_requests(self, current_time: float) -> None:
+        """Remove requests outside the sliding window."""
+        cutoff_time = current_time - self.window_size
+        while self.requests and self.requests[0] < cutoff_time:
+            self.requests.popleft()
+
+
+class WorkspaceThrottleManager:
+    """Coordinates all throttling layers for the workspace."""
+    
+    def __init__(self):
+        self.rate_limiter = GenieRateLimiter()
+        self.request_queue = deque()
+        self.queue_lock = RLock()
+        self.metrics = ThrottleMetrics()
+        self.metrics_lock = RLock()
+        self.processing_thread = None
+        self.shutdown_event = threading.Event()
+        
+        # Start background queue processor
+        self._start_queue_processor()
+        
+        logger.info("Initialized WorkspaceThrottleManager with enhanced throttling")
+    
+    def submit_request(self, user_id: str, request_callable, 
+                      request_args: Tuple = (), request_kwargs: Dict = None,
+                      priority: int = 0, timeout: float = Config.GENIE_QUEUE_TIMEOUT) -> Tuple[ThrottleStatus, Any]:
+        """Submit a request through the throttling system."""
+        if request_kwargs is None:
+            request_kwargs = {}
+            
+        request_id = f"{user_id}_{int(time.time() * 1000)}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
+        
+        with self.metrics_lock:
+            self.metrics.total_requests += 1
+        
+        # Check if we can proceed immediately
+        if self.rate_limiter.can_proceed():
+            if self.rate_limiter.record_request():
+                with self.metrics_lock:
+                    self.metrics.allowed_requests += 1
+                
+                try:
+                    result = request_callable(*request_args, **request_kwargs)
+                    return ThrottleStatus.ALLOWED, result
+                except Exception as e:
+                    logger.error(f"Error executing immediate request: {e}")
+                    return ThrottleStatus.ALLOWED, None
+        
+        # Check queue capacity
+        with self.queue_lock:
+            if len(self.request_queue) >= Config.GENIE_QUEUE_MAX_SIZE:
+                with self.metrics_lock:
+                    self.metrics.queue_full_rejections += 1
+                logger.warning(f"Queue full, rejecting request from user {user_id}")
+                return ThrottleStatus.QUEUE_FULL, None
+        
+        # Queue the request
+        queued_request = QueuedRequest(
+            request_id=request_id,
+            user_id=user_id,
+            timestamp=time.time(),
+            priority=priority,
+            timeout=timeout,
+            metadata={
+                'callable': request_callable,
+                'args': request_args,
+                'kwargs': request_kwargs,
+                'result': None,
+                'completed': False,
+                'error': None
+            }
+        )
+        
+        with self.queue_lock:
+            # Insert with priority (higher priority first, then FIFO)
+            inserted = False
+            for i, existing_request in enumerate(self.request_queue):
+                if priority > existing_request.priority:
+                    self.request_queue.insert(i, queued_request)
+                    inserted = True
+                    break
+            
+            if not inserted:
+                self.request_queue.append(queued_request)
+        
+        with self.metrics_lock:
+            self.metrics.queued_requests += 1
+            self.metrics.current_queue_depth = len(self.request_queue)
+        
+        logger.info(f"Queued request {request_id} for user {user_id}, position: {self._get_queue_position(request_id)}")
+        
+        # Wait for completion or timeout
+        return self._wait_for_request_completion(queued_request)
+    
+    def get_queue_status(self, user_id: str) -> Dict[str, Any]:
+        """Get queue status for a specific user."""
+        with self.queue_lock:
+            user_requests = [req for req in self.request_queue if req.user_id == user_id]
+            queue_depth = len(self.request_queue)
+            
+        if not user_requests:
+            return {
+                'in_queue': False,
+                'position': 0,
+                'estimated_wait_time': 0,
+                'queue_depth': queue_depth
+            }
+        
+        # Get position of first user request
+        position = next(i for i, req in enumerate(self.request_queue) 
+                       if req.user_id == user_id) + 1
+        
+        # Estimate wait time based on current rate limit utilization
+        utilization = self.rate_limiter.get_utilization()
+        time_per_request = 60 / Config.GENIE_RATE_LIMIT_PER_MINUTE  # seconds per request
+        estimated_wait = position * time_per_request * (utilization / 100)
+        
+        return {
+            'in_queue': True,
+            'position': position,
+            'estimated_wait_time': estimated_wait,
+            'queue_depth': queue_depth,
+            'requests_ahead': position - 1
+        }
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get current throttling metrics."""
+        with self.metrics_lock:
+            with self.queue_lock:
+                self.metrics.current_queue_depth = len(self.request_queue)
+                self.metrics.rate_limit_utilization = self.rate_limiter.get_utilization()
+                
+                return {
+                    'total_requests': self.metrics.total_requests,
+                    'allowed_requests': self.metrics.allowed_requests,
+                    'rate_limited_requests': self.metrics.rate_limited_requests,
+                    'queued_requests': self.metrics.queued_requests,
+                    'queue_full_rejections': self.metrics.queue_full_rejections,
+                    'queue_timeouts': self.metrics.queue_timeouts,
+                    'current_queue_depth': self.metrics.current_queue_depth,
+                    'rate_limit_utilization': self.metrics.rate_limit_utilization,
+                    'avg_queue_wait_time': self.metrics.avg_queue_wait_time,
+                    'last_updated': self.metrics.last_updated.isoformat()
+                }
+    
+    def _start_queue_processor(self) -> None:
+        """Start the background queue processing thread."""
+        def process_queue():
+            while not self.shutdown_event.is_set():
+                try:
+                    self._process_next_request()
+                    time.sleep(Config.GENIE_THROTTLE_CHECK_INTERVAL)
+                except Exception as e:
+                    logger.error(f"Error in queue processor: {e}")
+                    time.sleep(5)  # Back off on error
+        
+        self.processing_thread = threading.Thread(target=process_queue, daemon=True)
+        self.processing_thread.start()
+        logger.info("Started queue processor thread")
+    
+    def _process_next_request(self) -> None:
+        """Process the next request from the queue if rate limits allow."""
+        with self.queue_lock:
+            if not self.request_queue:
+                return
+            
+            # Check for expired requests
+            current_time = time.time()
+            expired_requests = []
+            for req in list(self.request_queue):
+                if current_time - req.timestamp > req.timeout:
+                    expired_requests.append(req)
+                    self.request_queue.remove(req)
+            
+            for expired_req in expired_requests:
+                expired_req.metadata['completed'] = True
+                expired_req.metadata['error'] = "Request timed out in queue"
+                with self.metrics_lock:
+                    self.metrics.queue_timeouts += 1
+                logger.warning(f"Request {expired_req.request_id} timed out in queue")
+            
+            if not self.request_queue:
+                return
+            
+            # Check if we can process the next request
+            if not self.rate_limiter.can_proceed():
+                return
+            
+            next_request = self.request_queue.popleft()
+        
+        # Record the rate limit usage
+        if not self.rate_limiter.record_request():
+            # Put the request back if we couldn't record it
+            with self.queue_lock:
+                self.request_queue.appendleft(next_request)
+            return
+        
+        # Execute the request
+        start_time = time.time()
+        try:
+            callable_func = next_request.metadata['callable']
+            args = next_request.metadata['args']
+            kwargs = next_request.metadata['kwargs']
+            
+            result = callable_func(*args, **kwargs)
+            next_request.metadata['result'] = result
+            next_request.metadata['error'] = None
+            
+            with self.metrics_lock:
+                self.metrics.allowed_requests += 1
+                
+        except GenieRateLimitExceeded as e:
+            # Genie API rate limit exceeded - re-queue with priority and longer delay
+            logger.warning(f"Genie rate limit exceeded for request {next_request.request_id}, re-queuing with delay: {e}")
+            
+            # Add delay to avoid immediate retry
+            next_request.timestamp = time.time() + 30  # 30 second delay
+            next_request.priority += 10  # Increase priority for retry
+            next_request.metadata['retry_count'] = next_request.metadata.get('retry_count', 0) + 1
+            
+            # Re-queue the request if not too many retries
+            if next_request.metadata['retry_count'] <= 3:
+                with self.queue_lock:
+                    # Insert with higher priority
+                    inserted = False
+                    for i, existing_request in enumerate(self.request_queue):
+                        if next_request.priority > existing_request.priority:
+                            self.request_queue.insert(i, next_request)
+                            inserted = True
+                            break
+                    if not inserted:
+                        self.request_queue.append(next_request)
+                
+                logger.info(f"Re-queued request {next_request.request_id} (retry {next_request.metadata['retry_count']}/3)")
+                return  # Don't mark as completed, let it retry
+            else:
+                # Too many retries, mark as failed
+                next_request.metadata['result'] = None  
+                next_request.metadata['error'] = f"Max retries exceeded due to Genie rate limiting: {e}"
+                logger.error(f"Request {next_request.request_id} failed after 3 retry attempts due to rate limiting")
+                
+        except Exception as e:
+            next_request.metadata['result'] = None
+            next_request.metadata['error'] = str(e)
+            logger.error(f"Error executing queued request {next_request.request_id}: {e}")
+        
+        finally:
+            next_request.metadata['completed'] = True
+            
+            # Update average wait time
+            wait_time = time.time() - next_request.timestamp
+            with self.metrics_lock:
+                if self.metrics.avg_queue_wait_time == 0:
+                    self.metrics.avg_queue_wait_time = wait_time
+                else:
+                    self.metrics.avg_queue_wait_time = (self.metrics.avg_queue_wait_time * 0.9) + (wait_time * 0.1)
+                    
+            logger.info(f"Processed queued request {next_request.request_id}, wait time: {wait_time:.2f}s")
+    
+    def _wait_for_request_completion(self, queued_request: QueuedRequest) -> Tuple[ThrottleStatus, Any]:
+        """Wait for a queued request to complete."""
+        start_time = time.time()
+        
+        while not queued_request.metadata['completed']:
+            if time.time() - start_time > queued_request.timeout:
+                with self.metrics_lock:
+                    self.metrics.queue_timeouts += 1
+                return ThrottleStatus.TIMED_OUT, None
+            
+            time.sleep(0.5)  # Check every 500ms
+        
+        if queued_request.metadata['error']:
+            return ThrottleStatus.QUEUED, None
+        
+        return ThrottleStatus.QUEUED, queued_request.metadata['result']
+    
+    def _get_queue_position(self, request_id: str) -> int:
+        """Get the position of a request in the queue."""
+        with self.queue_lock:
+            for i, req in enumerate(self.request_queue):
+                if req.request_id == request_id:
+                    return i + 1
+        return 0
+    
+    def shutdown(self) -> None:
+        """Shutdown the throttle manager gracefully."""
+        self.shutdown_event.set()
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=10)
+        logger.info("WorkspaceThrottleManager shutdown completed")
+
+
 # Global state
 class BotState:
     """Centralized state management for the bot with performance optimizations."""
@@ -144,6 +537,9 @@ class BotState:
         # Performance optimizations
         self.performance_monitor = PerformanceMonitor()
         
+        # Enhanced throttling system
+        self.throttle_manager = WorkspaceThrottleManager()
+        
         # Thread-safe data structures
         self.processed_messages = set()
         self.processed_event_ids = set()
@@ -154,6 +550,7 @@ class BotState:
         self.message_queue = {}  # user_id -> queue of pending messages
         self.queue_locks = {}  # user_id -> lock for queue operations
         self.processing_users = set()  # users currently being processed
+        self.user_thread_counts = {}  # user_id -> number of active threads
         
         # Locks
         self.processed_messages_lock = RLock()
@@ -184,26 +581,14 @@ bot_state = BotState()
 
 
 def check_genie_rate_limit(bot_state) -> bool:
-    """Check if we can make a Genie API call within rate limits."""
-    current_time = time.time()
-    
-    with bot_state.genie_calls_lock:
-        # Remove API calls older than 1 minute
-        cutoff_time = current_time - 60
-        bot_state.genie_api_calls = [call_time for call_time in bot_state.genie_api_calls if call_time > cutoff_time]
-        
-        # Check if we're under the rate limit
-        if len(bot_state.genie_api_calls) >= Config.GENIE_RATE_LIMIT_PER_MINUTE:
-            logger.warning(f"Rate limit reached: {len(bot_state.genie_api_calls)} calls in the last minute")
-            return False
-        
-        # Record this API call
-        bot_state.genie_api_calls.append(current_time)
-        return True
+    """Check if we can make a Genie API call within rate limits - DEPRECATED."""
+    logger.warning("check_genie_rate_limit is deprecated, use throttle_manager instead")
+    return bot_state.throttle_manager.rate_limiter.can_proceed()
 
 
 def wait_for_genie_api_slot(bot_state, timeout: float = 30.0) -> bool:
-    """Wait for an available Genie API slot with timeout."""
+    """Wait for an available Genie API slot with timeout - DEPRECATED."""
+    logger.warning("wait_for_genie_api_slot is deprecated, use throttle_manager instead")
     try:
         acquired = bot_state.genie_rate_limiter.acquire(timeout=timeout)
         if not acquired:
@@ -215,11 +600,34 @@ def wait_for_genie_api_slot(bot_state, timeout: float = 30.0) -> bool:
 
 
 def release_genie_api_slot(bot_state) -> None:
-    """Release a Genie API slot."""
+    """Release a Genie API slot - DEPRECATED."""
+    logger.warning("release_genie_api_slot is deprecated, use throttle_manager instead")
     try:
         bot_state.genie_rate_limiter.release()
     except Exception as e:
         logger.error(f"Error releasing Genie API slot: {e}")
+
+
+def submit_genie_request(user_id: str, request_callable, bot_state, 
+                        request_args: Tuple = (), request_kwargs: Dict = None,
+                        priority: int = 0) -> Tuple[ThrottleStatus, Any]:
+    """Submit a Genie API request through the enhanced throttling system."""
+    if request_kwargs is None:
+        request_kwargs = {}
+    
+    logger.info(f"Submitting Genie request for user {user_id} through throttling system")
+    
+    status, result = bot_state.throttle_manager.submit_request(
+        user_id=user_id,
+        request_callable=request_callable,
+        request_args=request_args,
+        request_kwargs=request_kwargs,
+        priority=priority,
+        timeout=Config.GENIE_QUEUE_TIMEOUT
+    )
+    
+    logger.info(f"Genie request completed with status: {status.value}")
+    return status, result
 
 
 def wait_for_message_completion_with_backoff(workspace_client: WorkspaceClient, space_id: str, conversation_id: str, message_id: str):
@@ -338,71 +746,72 @@ def get_user_queue_lock(user_id: str, bot_state) -> RLock:
 
 
 def add_message_to_queue(user_id: str, event: Dict[str, Any], say, client, bot_state) -> None:
-    """Add a message to the user's processing queue."""
-    user_lock = get_user_queue_lock(user_id, bot_state)
-    
-    with user_lock:
-        if user_id not in bot_state.message_queue:
-            bot_state.message_queue[user_id] = []
+    """Process messages directly through the workspace throttle manager without user-based queuing."""
+    try:
+        # Check workspace rate limits using throttle manager
+        rate_utilization = bot_state.throttle_manager.rate_limiter.get_utilization()
         
-        # Add message to queue
-        bot_state.message_queue[user_id].append((event, say, client))
-        queue_length = len(bot_state.message_queue[user_id])
-        logger.info(f"📥 Added message to queue for user {user_id}. Queue length: {queue_length}")
-        
-        # Only show queue message if queue is getting long (more than 3 messages)
-        if queue_length > 3:
+        if rate_utilization < 95:
+            # Process immediately - workspace has capacity
+            logger.info(f"🚀 Processing message immediately for user {user_id} (workspace load: {rate_utilization:.1f}%)")
             try:
-                position = queue_length - 1  # 0-based index
-                say(f"⏳ *High demand detected* - You are #{position} in line. Processing your request...", thread_ts=event.get("ts"))
+                say(f"🤖 *Processing your request...*", thread_ts=event.get("ts"))
+            except Exception as e:
+                logger.error(f"Error sending processing message: {e}")
+            
+            # Submit directly to thread pool - let workspace throttle manager handle queuing if needed
+            bot_state.message_executor.submit(process_message_with_workspace_throttling, user_id, event, say, client, bot_state)
+        else:
+            # Workspace is near capacity - use workspace throttle manager for queuing
+            logger.info(f"📥 Submitting to workspace queue for user {user_id} (workspace load: {rate_utilization:.1f}%)")
+            try:
+                workspace_status = bot_state.throttle_manager.get_metrics()
+                queue_depth = workspace_status.get('current_queue_depth', 0)
+                avg_wait = workspace_status.get('avg_queue_wait_time', 0)
+                
+                if queue_depth > 0:
+                    say(f"⏳ *Request queued* - Workspace at {rate_utilization:.1f}% capacity\n"
+                        f"🔄 Queue depth: {queue_depth} requests\n"
+                        f"⏱️ Estimated wait: ~{avg_wait:.0f} seconds", 
+                        thread_ts=event.get("ts"))
+                else:
+                    say(f"⏳ *Request queued* - Processing shortly...", 
+                        thread_ts=event.get("ts"))
             except Exception as e:
                 logger.error(f"Error sending queue status message: {e}")
-        
-        # Start processing if not already processing AND if we have capacity AND user isn't at thread limit
-        active_users = len(bot_state.processing_users)
-        user_thread_count = 1 if user_id in bot_state.processing_users else 0
-        
-        if (user_id not in bot_state.processing_users and 
-            active_users < Config.MAX_CONCURRENT_USERS and 
-            user_thread_count < Config.MAX_THREADS_PER_USER):
-            bot_state.processing_users.add(user_id)
-            # Submit queue processing to thread pool
-            bot_state.message_executor.submit(process_user_queue, user_id, bot_state)
+            
+            # Submit through workspace throttle manager
+            def process_request():
+                process_message_async(event, say, client, bot_state)
+            
+            bot_state.message_executor.submit(
+                lambda: bot_state.throttle_manager.submit_request(
+                    user_id, process_request
+                )
+            )
+    except Exception as e:
+        logger.error(f"Error in add_message_to_queue for user {user_id}: {e}")
+        try:
+            say(f"❌ Sorry, I encountered an error: {str(e)}", thread_ts=event.get("ts"))
+        except Exception as say_error:
+            logger.error(f"Error sending error message: {say_error}")
+
+
+def process_message_with_workspace_throttling(user_id: str, event: Dict[str, Any], say, client, bot_state) -> None:
+    """Process a message directly, with workspace throttling handled internally."""
+    try:
+        process_message_async(event, say, client, bot_state)
+    except Exception as e:
+        logger.error(f"Error processing message for user {user_id}: {e}")
+        try:
+            say(f"❌ Sorry, I encountered an error processing your message: {str(e)}", thread_ts=event.get("ts"))
+        except Exception as say_error:
+            logger.error(f"Error sending error message: {say_error}")
 
 
 def process_user_queue(user_id: str, bot_state) -> None:
-    """Process all messages in a user's queue sequentially."""
-    user_lock = get_user_queue_lock(user_id, bot_state)
-    
-    try:
-        while True:
-            with user_lock:
-                if not bot_state.message_queue.get(user_id):
-                    # No more messages in queue
-                    break
-                
-                # Get next message from queue
-                event, say, client = bot_state.message_queue[user_id].pop(0)
-                logger.info(f"📤 Processing message from queue for user {user_id}. Remaining in queue: {len(bot_state.message_queue[user_id])}")
-            
-            # Process the message (outside the lock to avoid blocking)
-            try:
-                process_message_async(event, say, client, bot_state)
-                # Small delay between messages to prevent overwhelming the system
-                time.sleep(Config.MESSAGE_PROCESSING_DELAY)
-            except Exception as e:
-                logger.error(f"Error processing queued message for user {user_id}: {e}")
-                # Send error response
-                try:
-                    say(f"❌ Sorry, I encountered an error processing your message: {str(e)}", thread_ts=event.get("ts"))
-                except Exception as say_error:
-                    logger.error(f"Error sending error message: {say_error}")
-    
-    finally:
-        # Remove user from processing set
-        with bot_state.queue_lock:
-            bot_state.processing_users.discard(user_id)
-        logger.info(f"✅ Finished processing queue for user {user_id}")
+    """Legacy function - no longer used with new workspace-only throttling approach."""
+    logger.warning(f"process_user_queue called for user {user_id} - this function is deprecated")
 
 
 def is_bot_message(event: Dict[str, Any], bot_state) -> bool:
@@ -498,6 +907,7 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
             "💬 *Chat with Genie:* Just send any message to start a conversation!",
             "🔄 *Reset conversation:* Type `/reset` to start a fresh conversation",
             "📊 *Conversation status:* Type `/status` to see your current conversation",
+            "🚦 *System status:* Type `/throttle` to see current throttling status",
             "❓ *Get help:* Type `/help` to see this message",
             "",
             "💡 *Features:*",
@@ -505,6 +915,7 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
             "• **Context retention:** Genie remembers previous messages in threads",
             "• **Thread-based conversations:** Each Slack thread maintains its own conversation",
             "• **Automatic expiration:** Conversations expire after 1 hour of inactivity",
+            "• **Smart throttling:** System automatically manages API rate limits (5 QPM)",
             "",
             "📊 *Query Results:*",
             "• Genie can generate and execute SQL queries",
@@ -514,6 +925,48 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
             "Need help? Contact your workspace administrator."
         ]
         say("\n".join(help_text), thread_ts=message_ts)
+        return True
+    
+    # Handle throttle status command
+    if message_content_stripped in ['/throttle', 'throttle', 'system status', 'rate limit']:
+        try:
+            throttling_metrics = bot_state.throttle_manager.get_metrics()
+            queue_status = bot_state.throttle_manager.get_queue_status(channel_id)  # Use channel as user proxy
+            time_until_slot = bot_state.throttle_manager.rate_limiter.get_time_until_next_slot()
+            
+            status_text = [
+                "🚦 *System Status:*",
+                f"• **Queue Depth:** {throttling_metrics.get('current_queue_depth', 0)} requests waiting",
+                f"• **Average Wait Time:** {throttling_metrics.get('avg_queue_wait_time', 0):.1f} seconds",
+                "",
+                "📈 *Request Statistics:*",
+                f"• **Total Requests:** {throttling_metrics.get('total_requests', 0)}",
+                f"• **Immediately Processed:** {throttling_metrics.get('allowed_requests', 0)}",
+                f"• **Queued and Processed:** {throttling_metrics.get('queued_requests', 0)}",
+                f"• **Queue Full Rejections:** {throttling_metrics.get('queue_full_rejections', 0)}",
+                f"• **Timeouts:** {throttling_metrics.get('queue_timeouts', 0)}",
+                "",
+                f"⏱️ **Next Available Slot:** {time_until_slot:.0f} seconds" if time_until_slot > 0 else "✅ **Ready for requests**"
+            ]
+            
+            if queue_status['in_queue']:
+                status_text.extend([
+                    "",
+                    "👤 *Your Status:*",
+                    f"• **Position in Queue:** #{queue_status['position']}",
+                    f"• **Estimated Wait Time:** ~{queue_status['estimated_wait_time']:.0f} seconds"
+                ])
+                
+        except Exception as e:
+            logger.error(f"Error getting throttle status: {e}")
+            status_text = [
+                "🚦 *System Throttling Status:*",
+                "• **Error retrieving status**",
+                "",
+                "💡 *Tip:* The system uses smart throttling to manage API rate limits (5 QPM)"
+            ]
+        
+        say("\n".join(status_text), thread_ts=message_ts)
         return True
     
     # Handle conversation status command
@@ -696,19 +1149,11 @@ def format_query_summary(query_result: Any) -> str:
 def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
     """Send a message to Databricks Genie and get a response with API best practices."""
     start_time = time.time()
-    api_slot_acquired = False
     
     try:
         logger.info(f"Processing query: {msg_input[:50]}...")
         
-        # Wait for API slot and check rate limits
-        if not wait_for_genie_api_slot(bot_state):
-            return "⏳ System is at capacity. Please try again in a moment.", None, None, None
-        
-        api_slot_acquired = True
-        
-        if not check_genie_rate_limit(bot_state):
-            return "⏳ Rate limit reached. Please wait a moment before trying again.", None, None, None
+        # Rate limiting is now handled by WorkspaceThrottleManager before this function is called
         
         # Start or continue conversation
         if conversation_id:
@@ -793,11 +1238,6 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
         if bot_state and hasattr(bot_state, 'performance_monitor'):
             bot_state.performance_monitor.record_query(response_time, success=False)
         return create_error_response(e, "Genie communication")
-    
-    finally:
-        # Always release the API slot
-        if api_slot_acquired:
-            release_genie_api_slot(bot_state)
 
 
 def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, message_id: str, 
@@ -838,33 +1278,18 @@ def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, me
             # No query results available
             csv_bytes, filename = None, None
             
-            # Check if this is a system table query and provide specific guidance
-            query_text = query_attachment.query.lower()
-            is_system_query = any(table in query_text for table in Config.SYSTEM_TABLE_PATTERNS)
-            
-            if is_system_query:
-                response_parts.extend([
-                    "⚠️ *Query generated but could not be executed automatically.*",
-                    "This query accesses system tables which may require special permissions or workspace configuration.",
-                    "💡 **Suggestions:**",
-                    "• Check that your workspace has billing data enabled",
-                    "• Verify you have the necessary permissions to access system tables",
-                    "• Try running the query manually in your Databricks workspace",
-                    "• Contact your workspace administrator if you need access to billing data",
-                    "• The Genie space may need to be configured with appropriate warehouse permissions"
-                ])
-            else:
-                response_parts.extend([
-                    "⚠️ *Query generated but could not be executed automatically.*",
-                    "You can copy the SQL query above and run it manually in your Databricks workspace.",
-                    "💡 **Common reasons for failure:**",
-                    "• Genie space warehouse configuration issues",
-                    "• No available warehouses",
-                    "• Insufficient permissions",
-                    "• Network connectivity issues",
-                    "• Query timeout",
-                    "• Genie space may need to be reconfigured with proper warehouse access"
-                ])
+            response_parts.extend([
+                "⚠️ *Query generated but could not be executed automatically.*",
+                "You can copy the SQL query above and run it manually in your Databricks workspace.",
+                "💡 **Common reasons for failure:**",
+                "• Try running the query manually in your Databricks workspace",
+                "• Check that you have the necessary permissions to access the requested data",
+                "• Verify your Genie space has the appropriate warehouse permissions",
+                "• Genie space warehouse configuration issues",
+                "• No available warehouses",
+                "• Network connectivity issues",
+                "• Query timeout"
+            ])
         
         # Add download information for large files
         if csv_bytes:
@@ -1214,18 +1639,35 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
             
 
             
-            # Get response from Genie (continue existing or start new) - now using optimized SDK version
+            # Get response from Genie using throttling system
             try:
-                logger.info(f"🤖 Calling optimized speak_with_genie with message: {message_content[:50]}...")
-                genie_response, csv_bytes, filename, conversation_id = speak_with_genie_optimized(
-                    message_content, 
-                    workspace_client, 
-                    existing_conversation_id,  # Use existing conversation if available
-                    bot_state
+                logger.info(f"🤖 Submitting Genie request through throttling system: {message_content[:50]}...")
+                status, result = submit_genie_request(
+                    user_id=user_id,
+                    request_callable=speak_with_genie_optimized,
+                    bot_state=bot_state,
+                    request_args=(message_content, workspace_client, existing_conversation_id, bot_state),
+                    priority=0
                 )
-                logger.info(f"✅ Received response from Genie, length: {len(genie_response) if genie_response else 0}")
+                
+                if status == ThrottleStatus.ALLOWED:
+                    genie_response, csv_bytes, filename, conversation_id = result
+                    logger.info(f"✅ Received response from Genie, length: {len(genie_response) if genie_response else 0}")
+                elif status == ThrottleStatus.QUEUED:
+                    genie_response, csv_bytes, filename, conversation_id = result
+                    logger.info(f"✅ Received queued response from Genie, length: {len(genie_response) if genie_response else 0}")
+                elif status == ThrottleStatus.QUEUE_FULL:
+                    genie_response = "⏳ System is busy. Please try again in a few moments."
+                    csv_bytes, filename, conversation_id = None, None, None
+                elif status == ThrottleStatus.TIMED_OUT:
+                    genie_response = "⏰ Request timed out. Please try a simpler query or try again later."
+                    csv_bytes, filename, conversation_id = None, None, None
+                else:
+                    genie_response = "❌ Rate limit exceeded. Please try again in a moment."
+                    csv_bytes, filename, conversation_id = None, None, None
+                    
             except Exception as genie_error:
-                logger.error(f"Error in speak_with_genie: {genie_error}")
+                logger.error(f"Error in throttled Genie request: {genie_error}")
                 genie_response = f"❌ Sorry, I encountered an error while processing your request: {str(genie_error)}"
                 csv_bytes, filename, conversation_id = None, None, None
         
@@ -1462,9 +1904,10 @@ def main() -> None:
                     total_queued_messages = sum(len(queue) for queue in bot_state.message_queue.values())
                     active_user_queues = len([q for q in bot_state.message_queue.values() if q])
                     
-                    # Get performance metrics
+                    # Get performance and throttling metrics
                     try:
                         performance_metrics = bot_state.performance_monitor.get_metrics()
+                        throttling_metrics = bot_state.throttle_manager.get_metrics()
                         
                         logger.info(f"💓 Enhanced Heartbeat - Time: {datetime.now().isoformat()}")
                         logger.info(f"   📊 Performance - Avg Response: {performance_metrics.get('avg_response_time', 0):.2f}s, "
@@ -1473,6 +1916,13 @@ def main() -> None:
                         logger.info(f"   📨 Queue - Active Users: {active_user_queues}, "
                                   f"Messages: {total_queued_messages}, "
                                   f"Processing Users: {len(bot_state.processing_users)}")
+                        logger.info(f"   🚦 Throttling - Rate Limit: {throttling_metrics.get('rate_limit_utilization', 0):.1f}%, "
+                                  f"Queue Depth: {throttling_metrics.get('current_queue_depth', 0)}, "
+                                  f"Avg Wait: {throttling_metrics.get('avg_queue_wait_time', 0):.1f}s")
+                        logger.info(f"   📈 Throttling Stats - Total: {throttling_metrics.get('total_requests', 0)}, "
+                                  f"Allowed: {throttling_metrics.get('allowed_requests', 0)}, "
+                                  f"Queued: {throttling_metrics.get('queued_requests', 0)}, "
+                                  f"Rejected: {throttling_metrics.get('queue_full_rejections', 0)}")
                         logger.info(f"   💬 Conversations: {len(bot_state.conversation_tracker)}")
 
                     except Exception as heartbeat_error:
@@ -1494,6 +1944,12 @@ def main() -> None:
         # Set up graceful shutdown
         def signal_handler(sig, frame):
             logger.info("🛑 Received shutdown signal, shutting down...")
+            # Gracefully shutdown the throttle manager
+            try:
+                bot_state.throttle_manager.shutdown()
+                logger.info("✅ Throttle manager shutdown completed")
+            except Exception as e:
+                logger.error(f"Error during throttle manager shutdown: {e}")
             sys.exit(0)
         
         signal.signal(signal.SIGINT, signal_handler)
@@ -1595,19 +2051,11 @@ def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_i
 def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
     """Optimized Genie interaction using SDK best practices and built-in waiters."""
     start_time = time.time()
-    api_slot_acquired = False
     
     try:
         logger.info(f"Processing query with SDK waiters: {msg_input[:50]}...")
         
-        # Wait for API slot and check rate limits
-        if not wait_for_genie_api_slot(bot_state):
-            return "⏳ System is at capacity. Please try again in a moment.", None, None, None
-        
-        api_slot_acquired = True
-        
-        if not check_genie_rate_limit(bot_state):
-            return "⏳ Rate limit reached. Please wait a moment before trying again.", None, None, None
+        # Rate limiting is now handled by WorkspaceThrottleManager before this function is called
         
         # Use SDK's built-in waiters instead of custom polling
         try:
@@ -1642,8 +2090,10 @@ def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient
             logger.error(f"Bad request: {e}")
             return f"❌ Invalid request: {e}", None, None, conversation_id
         except TooManyRequests as e:
-            logger.error(f"Rate limit exceeded: {e}")
-            return f"❌ Rate limit exceeded. Please try again later: {e}", None, None, conversation_id
+            logger.warning(f"Genie API rate limit exceeded, will be retried by throttle manager: {e}")
+            # Instead of returning an error, raise the exception so the throttle manager 
+            # can catch it and re-queue the request with backoff
+            raise GenieRateLimitExceeded(f"Genie API rate limit exceeded: {e}") from e
         except InternalError as e:
             logger.error(f"Internal error: {e}")
             return f"❌ Databricks service temporarily unavailable: {e}", None, None, conversation_id
@@ -1683,11 +2133,6 @@ def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient
         if bot_state and hasattr(bot_state, 'performance_monitor'):
             bot_state.performance_monitor.record_query(response_time, success=False)
         return create_error_response(e, "Genie communication")
-    
-    finally:
-        # Always release the API slot
-        if api_slot_acquired:
-            release_genie_api_slot(bot_state)
 
 
 if __name__ == '__main__':
