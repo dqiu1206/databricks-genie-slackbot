@@ -10,7 +10,7 @@ from flask import Flask, request, jsonify
 
 from .config import Config
 from .utils import (
-    speak_with_genie
+    speak_with_genie_optimized
 )
 
 logger = logging.getLogger(__name__)
@@ -29,8 +29,8 @@ def health_check():
         'status': 'healthy',
         'service': 'slackbot-backend',
         'databricks_connected': bot_state.workspace_client is not None,
-        'slack_connected': bot_state.slack_app is not None,
-        'socket_mode_active': bot_state.socket_handler is not None and bot_state.socket_handler.is_running,
+        'slack_connected': bot_state.web_client is not None,
+        'socket_mode_active': bot_state.socket_mode_client is not None,
         'performance': {
             'metrics': performance_metrics
         }
@@ -53,8 +53,8 @@ def chat_endpoint():
         if not bot_state.workspace_client:
             return jsonify({'error': 'Databricks client not initialized'}), 500
         
-        # Get response from Genie (API endpoint always starts fresh conversations)
-        genie_response, csv_bytes, filename, conversation_id = speak_with_genie(message, bot_state.workspace_client, None, bot_state)
+        # Get response from Genie (API endpoint always starts fresh conversations) - using optimized version
+        genie_response, csv_bytes, filename, conversation_id = speak_with_genie_optimized(message, bot_state.workspace_client, None, bot_state)
         
         response_data = {
             'response': genie_response,
@@ -98,9 +98,9 @@ def status():
         'databricks_host': bot_state.databricks_host,
         'genie_space_id': bot_state.genie_space_id,
         'databricks_connected': bot_state.workspace_client is not None,
-        'slack_connected': bot_state.slack_app is not None,
-        'socket_mode_active': bot_state.socket_handler is not None and bot_state.socket_handler.is_running,
-        'socket_thread_running': bot_state.socket_handler is not None and bot_state.socket_handler.is_running,
+        'slack_connected': bot_state.web_client is not None,
+        'socket_mode_active': bot_state.socket_mode_client is not None,
+        'socket_thread_running': bot_state.socket_thread is not None and bot_state.socket_thread.is_alive(),
         'conversation_stats': {
             'active_conversations': len(bot_state.conversation_tracker),
             'max_conversation_age_seconds': Config.MAX_CONVERSATION_AGE
@@ -109,8 +109,7 @@ def status():
             'processing_users': len(bot_state.processing_users),
             'active_user_queues': active_user_queues,
             'total_queued_messages': total_queued_messages,
-            'max_concurrent_users': Config.MAX_CONCURRENT_USERS,
-            'max_threads_per_user': Config.MAX_THREADS_PER_USER,
+            'note': 'No user-based limits - only workspace QPM limits apply',
             'user_queue_details': {
                 user_id: len(queue) for user_id, queue in bot_state.message_queue.items() if queue
             }

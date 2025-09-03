@@ -13,33 +13,43 @@ from .config import Config, GenieError
 logger = logging.getLogger(__name__)
 
 
-def get_databricks_client(bot_state) -> WorkspaceClient:
-    """Create and return a Databricks workspace client."""
+def get_databricks_client_optimized(bot_state) -> WorkspaceClient:
+    """Create Databricks client using SDK best practices with automatic credential detection."""
     try:
-        # Check if we have OAuth2 credentials
+        # Use SDK's automatic credential detection when possible
         if bot_state.client_id and bot_state.client_secret:
+            logger.info("Using OAuth2 client credentials authentication")
             client = WorkspaceClient(
                 host=bot_state.databricks_host,
                 client_id=bot_state.client_id,
                 client_secret=bot_state.client_secret
             )
         elif bot_state.access_token:
+            logger.info("Using personal access token authentication")
             client = WorkspaceClient(
                 host=bot_state.databricks_host,
                 token=bot_state.access_token
             )
         else:
-            raise ValueError("No valid authentication method configured")
+            logger.info("Using SDK automatic credential detection")
+            # Let SDK auto-detect credentials from environment
+            client = WorkspaceClient(host=bot_state.databricks_host)
         
         # Test the connection
-        client.current_user.me()
-        logger.info(f"Successfully connected to Databricks workspace: {bot_state.databricks_host}")
+        current_user = client.current_user.me()
+        logger.info(f"Successfully authenticated to Databricks workspace: {bot_state.databricks_host}")
+        logger.info(f"Authenticated as user: {getattr(current_user, 'user_name', 'unknown')}")
         
         return client
         
     except Exception as e:
-        logger.error(f"Failed to create Databricks client: {e}")
+        logger.error(f"Failed to create optimized Databricks client: {e}")
         raise
+
+
+def get_databricks_client(bot_state) -> WorkspaceClient:
+    """Main function - now uses optimized SDK implementation."""
+    return get_databricks_client_optimized(bot_state)
 
 
 def initialize_dbutils(workspace_client: WorkspaceClient, bot_state) -> None:
@@ -266,17 +276,10 @@ def execute_query_with_fallback(workspace_client: WorkspaceClient, space_id: str
             if warehouse_id:
                 logger.info(f"Using warehouse ID: {warehouse_id}")
                 
-                # Check if this is a system table query
-                query_text = query_attachment.query.lower()
-                is_system_query = any(table in query_text for table in Config.SYSTEM_TABLE_PATTERNS)
-                
-                if is_system_query:
-                    logger.info("Detected system table query - this may require special permissions")
-                
                 query_result = workspace_client.statement_execution.execute_statement(
                     warehouse_id=warehouse_id,
                     statement=query_attachment.query,
-                    wait_timeout="120s" if is_system_query else "60s"
+                    wait_timeout="900s"  # 15 minutes to match Genie's timeout
                 )
                 logger.info("Successfully executed query directly")
                 return query_result
