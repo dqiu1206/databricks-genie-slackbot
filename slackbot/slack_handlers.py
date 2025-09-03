@@ -5,58 +5,44 @@ This module handles all Slack-specific logic including event handlers, Socket Mo
 and message processing.
 """
 
-import ssl
 import time
 import logging
 import threading
 from typing import Dict, Any, Optional
 
 import slack_sdk
-from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_sdk.web import WebClient
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.socket_mode.response import SocketModeResponse
+from slack_sdk.socket_mode.request import SocketModeRequest
 
 from .config import Config
-from .utils import (
-    process_message_async, add_message_to_queue
-)
 
 logger = logging.getLogger(__name__)
 
 
-def get_slack_app(bot_state) -> App:
-    """Initialize and return a Slack app with Socket Mode support."""
+def get_slack_web_client(bot_state) -> WebClient:
+    """Initialize and return a secure Slack WebClient."""
     try:
-        # Create SSL context for Slack
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-
-        # Create Slack client and test connection
-        client = slack_sdk.WebClient(token=bot_state.slack_bot_token, ssl=ssl_context)
+        # Create secure Slack client (SSL verification enabled by default)
+        client = WebClient(token=bot_state.slack_bot_token)
         auth_test = client.auth_test()
         
-        logger.info(f"Connected to Slack workspace: {auth_test['team']}")
+        logger.info(f"Securely connected to Slack workspace: {auth_test['team']}")
         logger.info(f"Bot user: {auth_test['user']}")
         
         # Store bot user ID for loop prevention
         bot_state.bot_user_id = auth_test.get('user_id')
         logger.info(f"Bot user ID: {bot_state.bot_user_id}")
         
-        # Create Slack app with enhanced settings
-        slack_app = App(
-            client=client, 
-            process_before_response=True
-        )
-        logger.info("Successfully initialized Slack app with Socket Mode support")
-        
-        return slack_app
+        return client
     except Exception as e:
-        logger.error(f"Failed to initialize Slack app: {e}")
+        logger.error(f"Failed to initialize Slack WebClient: {e}")
         raise
 
 
-def get_socket_handler(slack_app: App, bot_state) -> SocketModeHandler:
-    """Initialize and return a Socket Mode handler."""
+def get_socket_mode_client(bot_state) -> SocketModeClient:
+    """Initialize and return a Socket Mode client following SDK best practices."""
     try:
         if not bot_state.slack_app_token:
             raise ValueError("SLACK_APP_TOKEN is required for Socket Mode")
@@ -64,13 +50,88 @@ def get_socket_handler(slack_app: App, bot_state) -> SocketModeHandler:
         if not bot_state.slack_app_token.startswith('xapp-'):
             raise ValueError("SLACK_APP_TOKEN should start with 'xapp-' (Socket Mode token)")
         
-        logger.info(f"Creating Socket Mode handler with app token: {bot_state.slack_app_token[:10]}...")
-        handler = SocketModeHandler(slack_app, bot_state.slack_app_token)
-        logger.info("Successfully initialized Socket Mode handler")
-        return handler
+        # Create WebClient for API calls
+        web_client = get_slack_web_client(bot_state)
+        
+        logger.info(f"Creating Socket Mode client with app token: {bot_state.slack_app_token[:10]}...")
+        client = SocketModeClient(
+            app_token=bot_state.slack_app_token,
+            web_client=web_client,
+            auto_reconnect_enabled=True,  # SDK handles reconnection
+            trace_enabled=False  # Enable only for debugging
+        )
+        
+        # Register the proper request listener
+        client.socket_mode_request_listeners.append(
+            lambda client, req: process_socket_mode_request(client, req, bot_state)
+        )
+        
+        logger.info("Successfully initialized Socket Mode client")
+        return client
     except Exception as e:
-        logger.error(f"Failed to initialize Socket Mode handler: {e}")
+        logger.error(f"Failed to initialize Socket Mode client: {e}")
         raise
+
+
+def process_socket_mode_request(client: SocketModeClient, req: SocketModeRequest, bot_state):
+    """Process Socket Mode requests with proper acknowledgment following SDK best practices."""
+    try:
+        # CRITICAL: Always acknowledge first to prevent message loss
+        response = SocketModeResponse(envelope_id=req.envelope_id)
+        client.send_socket_mode_response(response)
+        
+        if req.type == "events_api":
+            event = req.payload["event"]
+            
+            # Skip bot messages to prevent loops
+            if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
+                logger.debug("Ignoring bot message to prevent loops")
+                return
+                
+            # Skip messages from the bot itself
+            user_id = event.get("user", "")
+            if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
+                logger.debug("Ignoring message from bot itself")
+                return
+            
+            # Handle different event types
+            if event.get("type") == "message":
+                handle_message_event(event, client.web_client, bot_state)
+            elif event.get("type") == "app_mention":
+                handle_app_mention_event(event, client.web_client, bot_state)
+                
+    except Exception as e:
+        logger.error(f"Error processing Socket Mode request: {e}")
+
+
+def handle_message_event(event: Dict[str, Any], web_client: WebClient, bot_state):
+    """Handle message events - only process DMs."""
+    channel_id = event.get("channel", "")
+    
+    # Only process direct messages (DMs)
+    if channel_id.startswith("D"):
+        logger.debug(f"Processing direct message in channel {channel_id}")
+        from .utils import add_message_to_queue
+        add_message_to_queue(event.get("user", "unknown"), event, 
+                           lambda text, thread_ts=None: web_client.chat_postMessage(
+                               channel=channel_id, text=text, thread_ts=thread_ts), 
+                           web_client, bot_state)
+    else:
+        logger.debug(f"Ignoring channel message in {channel_id} - requires explicit mention (@bot)")
+
+
+def handle_app_mention_event(event: Dict[str, Any], web_client: WebClient, bot_state):
+    """Handle app mention events - process mentions in channels and threads."""
+    channel_id = event.get("channel", "unknown")
+    user_id = event.get("user", "unknown")
+    
+    logger.info(f"📨 Received app_mention event: channel: {channel_id}, user: {user_id}")
+    
+    from .utils import add_message_to_queue
+    add_message_to_queue(user_id, event,
+                       lambda text, thread_ts=None: web_client.chat_postMessage(
+                           channel=channel_id, text=text, thread_ts=thread_ts),
+                       web_client, bot_state)
 
 
 def get_channel_info(client, channel_id: str) -> Optional[Dict[str, Any]]:
@@ -155,148 +216,49 @@ def invite_bot_to_channel(client, channel_id: str) -> bool:
 
 
 def setup_slack_handlers(bot_state) -> None:
-    """Set up Slack event handlers."""
-    if bot_state.slack_app is not None:
-        logger.info("Setting up Slack event handlers...")
-        
-        # Add a test handler to verify events are being received
-        @bot_state.slack_app.event("hello")
-        def handle_hello(event: Dict[str, Any]) -> None:
-            """Handle Socket Mode hello event for connection verification."""
-            logger.info("👋 Socket Mode connected successfully - received hello event")
-        
-        def process_message(event: Dict[str, Any], say, client) -> None:
-            """Add message to user queue for sequential processing per user."""
-            user_id = event.get("user", "unknown_user")
-            channel_id = event.get("channel", "unknown_channel")
-            thread_ts = event.get('thread_ts')
-            
-            # All messages are now queued per user regardless of thread status
-            # This ensures each user is limited to 1 thread across all conversations
-            logger.debug(f"Adding message to queue for user {user_id} in channel {channel_id}")
-            add_message_to_queue(user_id, event, say, client, bot_state)
-        
-        @bot_state.slack_app.event("message")
-        def handle_message(event: Dict[str, Any], say) -> None:
-            """Handle direct messages only. Channel messages require explicit mentions."""
-            logger.info(f"📨 Received message event: {event.get('type', 'unknown')}, channel: {event.get('channel', 'unknown')}, user: {event.get('user', 'unknown')}, text: {event.get('text', '')[:50]}")
-            
-            # Get channel information
-            channel_id = event.get("channel", "")
-            user_id = event.get("user", "")
-            
-            # Skip bot messages to prevent loops
-            if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
-                logger.debug("Ignoring bot message to prevent loops")
-                return
-            
-            # Skip messages from the bot itself
-            if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
-                logger.debug("Ignoring message from bot itself")
-                return
-            
-            # Only process direct messages (DMs) - channel messages require explicit mentions
-            if channel_id.startswith("D"):  # Direct message
-                logger.debug(f"Processing direct message in channel {channel_id}")
-                if bot_state.slack_app and bot_state.slack_app.client:
-                    process_message(event, say, bot_state.slack_app.client)
-            else:
-                # For channel messages, ignore them - they should be handled by app_mention event
-                logger.debug(f"Ignoring channel message in {channel_id} - requires explicit mention (@bot)")
-                return
-
-        @bot_state.slack_app.event("app_mention")
-        def handle_app_mention(event: Dict[str, Any], say) -> None:
-            """Handle app mentions (@botname) in channels and threads."""
-            channel_id = event.get("channel", "unknown")
-            user_id = event.get("user", "unknown")
-            thread_ts = event.get("thread_ts")
-            message_text = event.get("text", "")
-            
-            thread_info = f" in thread {thread_ts}" if thread_ts else ""
-            logger.info(f"📨 Received app_mention event: channel: {channel_id}, user: {user_id}{thread_info}")
-            logger.info(f"   Mention text: {message_text[:100]}...")
-            
-            # Skip bot messages to prevent loops
-            if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
-                logger.debug("Ignoring bot mention in bot message to prevent loops")
-                return
-            
-            # Skip messages from the bot itself
-            if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
-                logger.debug("Ignoring mention from bot itself")
-                return
-            
-            if bot_state.slack_app and bot_state.slack_app.client:
-                process_message(event, say, bot_state.slack_app.client)
-        
-        # Add handler for channel join events to automatically invite bot when needed
-        @bot_state.slack_app.event("channel_joined")
-        def handle_channel_joined(event: Dict[str, Any]) -> None:
-            """Handle when bot joins a channel."""
-            channel_id = event.get("channel", {}).get("id")
-            channel_name = event.get("channel", {}).get("name", "unknown")
-            if channel_id:
-                logger.info(f"Bot joined channel #{channel_name} ({channel_id})")
-        
-        @bot_state.slack_app.event("group_joined")
-        def handle_group_joined(event: Dict[str, Any]) -> None:
-            """Handle when bot joins a private group."""
-            channel_id = event.get("channel", {}).get("id")
-            channel_name = event.get("channel", {}).get("name", "unknown")
-            if channel_id:
-                logger.info(f"Bot joined private group #{channel_name} ({channel_id})")
-        
-        # Add catch-all handler for debugging
-        @bot_state.slack_app.event("*")
-        def handle_all_events(event: Dict[str, Any]) -> None:
-            """Catch-all handler for debugging unhandled events."""
-            event_type = event.get('type', 'unknown')
-            if event_type not in ['message', 'app_mention', 'hello', 'channel_joined', 'group_joined']:
-                logger.warning(f"🔍 Unhandled event type: {event_type}, event: {event}")
-        
-        logger.info("✅ Slack event handlers registered successfully")
-        logger.info("📡 Registered event handlers: message (DM only), app_mention (channels/threads), channel_joined, group_joined, hello")
-    else:
-        logger.error("❌ Cannot set up Slack handlers - slack_app is None")
+    """Set up Slack Socket Mode client - handlers are now in process_socket_mode_request."""
+    logger.info("✅ Slack Socket Mode client configured with proper event acknowledgment")
+    logger.info("📡 Event handling: message (DM only), app_mention (channels/threads) with SDK best practices")
 
 
 def start_socket_mode(bot_state) -> None:
-    """Start the Socket Mode handler in a separate thread."""
-    if bot_state.socket_handler is None:
-        logger.error("Socket handler not initialized")
+    """Start the Socket Mode client using SDK best practices."""
+    if bot_state.socket_mode_client is None:
+        logger.error("Socket Mode client not initialized")
         return
     
-    def run_socket_handler() -> None:
+    def run_socket_client() -> None:
         try:
-            logger.info("Starting Socket Mode handler...")
-            if bot_state.socket_handler:
-                logger.info("Socket Mode handler is starting - you should see connection messages from slack_bolt")
-                bot_state.socket_handler.start()
+            logger.info("Starting Socket Mode client...")
+            # Connect using SDK's built-in connection management
+            bot_state.socket_mode_client.connect()
         except Exception as e:
-            logger.error(f"Socket Mode handler error: {e}")
+            logger.error(f"Socket Mode client error: {e}")
             bot_state.socket_handler_error = e
     
-    bot_state.socket_thread = threading.Thread(target=run_socket_handler, daemon=True)
+    bot_state.socket_thread = threading.Thread(target=run_socket_client, daemon=True)
     bot_state.socket_thread.start()
-    logger.info("Socket Mode handler started in background thread")
+    logger.info("Socket Mode client started in background thread")
     
     # Give it a moment to start and verify connection
     time.sleep(Config.SOCKET_CONNECTION_DELAY)
     
-    # Check if thread is alive and handler is running
+    # Check if thread is alive and client is running
     if bot_state.socket_thread.is_alive():
         logger.info("✅ Socket Mode thread is running")
         
-        # Additional verification - check if handler is actually connected
+        # Additional verification - check if client is connected
         time.sleep(2)  # Give more time for connection
-        if hasattr(bot_state.socket_handler, 'client') and bot_state.socket_handler.client:
-            logger.info("✅ Socket Mode WebSocket client is initialized")
-        else:
-            logger.warning("⚠️ Socket Mode client may not be properly connected")
+        try:
+            if bot_state.socket_mode_client.is_connected():
+                logger.info("✅ Socket Mode client is connected")
+            else:
+                logger.warning("⚠️ Socket Mode client may not be properly connected")
+        except AttributeError:
+            logger.debug("Connection status check not available")
             
         # Check for any errors during startup
         if hasattr(bot_state, 'socket_handler_error') and bot_state.socket_handler_error:
-            logger.error(f"❌ Socket handler encountered error: {bot_state.socket_handler_error}")
+            logger.error(f"❌ Socket client encountered error: {bot_state.socket_handler_error}")
     else:
         logger.error("❌ Socket Mode thread failed to start") 

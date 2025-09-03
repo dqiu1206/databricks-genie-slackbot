@@ -14,15 +14,19 @@ import logging
 import threading
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor
 from threading import RLock
 from dataclasses import dataclass, field
 
 from databricks.sdk import WorkspaceClient
+from databricks.sdk.errors import (
+    ResourceDoesNotExist, PermissionDenied, BadRequest, 
+    InternalError, TooManyRequests
+)
 
-from .config import Config
+from .config import Config, GenieError
 from .databricks_client import (
     get_databricks_client, initialize_dbutils, extract_conversation_ids,
     wait_for_message_completion, execute_query_with_fallback, 
@@ -118,8 +122,8 @@ class BotState:
     
     def __init__(self):
         self.workspace_client: Optional[WorkspaceClient] = None
-        self.slack_app: Optional[Any] = None
-        self.socket_handler: Optional[Any] = None
+        self.web_client: Optional[Any] = None  # Slack WebClient
+        self.socket_mode_client: Optional[Any] = None  # Socket Mode client
         self.socket_thread: Optional[threading.Thread] = None
         self.socket_handler_error: Optional[Exception] = None
         self.bot_user_id: Optional[str] = None
@@ -1210,10 +1214,10 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
             
 
             
-            # Get response from Genie (continue existing or start new)
+            # Get response from Genie (continue existing or start new) - now using optimized SDK version
             try:
-                logger.info(f"🤖 Calling speak_with_genie with message: {message_content[:50]}...")
-                genie_response, csv_bytes, filename, conversation_id = speak_with_genie(
+                logger.info(f"🤖 Calling optimized speak_with_genie with message: {message_content[:50]}...")
+                genie_response, csv_bytes, filename, conversation_id = speak_with_genie_optimized(
                     message_content, 
                     workspace_client, 
                     existing_conversation_id,  # Use existing conversation if available
@@ -1390,13 +1394,13 @@ def initialize_clients(bot_state) -> None:
         else:
             logger.info("✅ Using existing Databricks workspace client")
         
-        from .slack_handlers import get_slack_app, get_socket_handler, setup_slack_handlers
-        bot_state.slack_app = get_slack_app(bot_state)
-        logger.info("✅ Slack app initialized")
+        from .slack_handlers import get_slack_web_client, get_socket_mode_client, setup_slack_handlers
+        bot_state.web_client = get_slack_web_client(bot_state)
+        logger.info("✅ Slack WebClient initialized")
         
-        # Create Socket Mode handler for Slack
-        bot_state.socket_handler = get_socket_handler(bot_state.slack_app, bot_state)
-        logger.info("✅ Socket Mode handler created")
+        # Create Socket Mode client for Slack
+        bot_state.socket_mode_client = get_socket_mode_client(bot_state)
+        logger.info("✅ Socket Mode client created")
         
         # Set up Slack event handlers
         setup_slack_handlers(bot_state)
@@ -1438,12 +1442,15 @@ def main() -> None:
         time.sleep(5)
         
         # Verify Socket Mode is running
-        if bot_state.socket_handler and hasattr(bot_state.socket_handler, 'is_running'):
-            if bot_state.socket_handler.is_running:
-                logger.info("✅ Socket Mode is running and connected")
-            else:
-                logger.error("❌ Socket Mode handler is not running properly")
-                logger.error("Please check your SLACK_APP_TOKEN and ensure it starts with 'xapp-'")
+        if bot_state.socket_mode_client:
+            try:
+                if bot_state.socket_mode_client.is_connected():
+                    logger.info("✅ Socket Mode client is running and connected")
+                else:
+                    logger.error("❌ Socket Mode client is not connected properly")
+                    logger.error("Please check your SLACK_APP_TOKEN and ensure it starts with 'xapp-'")
+            except AttributeError:
+                logger.info("✅ Socket Mode client is initialized (connection status check not available)")
         
         # Start heartbeat thread for monitoring
         def heartbeat() -> None:
@@ -1501,6 +1508,186 @@ def main() -> None:
 
 
 
+
+
+def extract_conversation_id_from_message(message_result: Any) -> Optional[str]:
+    """Extract conversation ID from a Genie message result."""
+    try:
+        # Try various ways to get conversation ID
+        if hasattr(message_result, 'conversation_id'):
+            return str(message_result.conversation_id)
+        elif hasattr(message_result, 'conversation') and hasattr(message_result.conversation, 'id'):
+            return str(message_result.conversation.id)
+        else:
+            logger.warning("Could not extract conversation ID from message result")
+            return None
+    except Exception as e:
+        logger.error(f"Error extracting conversation ID: {e}")
+        return None
+
+
+def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_id: str, message_result: Any,
+                                     attachment_id: Optional[str], query_attachment: Any,
+                                     genie_text_response: List[str], bot_state) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
+    """Process query attachment using SDK best practices."""
+    try:
+        logger.info("Processing query attachment with SDK optimizations")
+        
+        response_parts = []
+        response_parts.append(f"Genie generated a query: {query_attachment.description}")
+        
+        # Only show the SQL query if SHOW_SQL_QUERY is enabled
+        if bot_state.show_sql_query:
+            response_parts.append(f"Query: ```sql\n{query_attachment.query}\n```")
+        
+        # Try to execute query using proven fallback approach
+        query_result = None
+        if hasattr(message_result, 'id'):
+            message_id = str(message_result.id)
+            # Use the proven fallback query execution approach
+            from .databricks_client import execute_query_with_fallback
+            query_result = execute_query_with_fallback(
+                workspace_client, str(bot_state.genie_space_id), conv_id, 
+                message_id, attachment_id, query_attachment
+            )
+            if query_result:
+                logger.info("Successfully executed query using fallback approach")
+        
+        # Handle query result if available
+        if query_result:
+            response_parts.append("✅ Query executed successfully")
+            
+            # Create CSV file from query results
+            csv_bytes, filename, _ = create_csv_from_query_results(query_result, workspace_client, query_attachment.query)
+            
+            # Add preview of results to text response
+            preview_text = format_query_results(query_result, workspace_client)
+            response_parts.append(preview_text)
+        else:
+            # No query results available - provide guidance
+            csv_bytes, filename = None, None
+            response_parts.extend([
+                "⚠️ *Query generated but could not be executed automatically.*",
+                "You can copy the SQL query above and run it manually in your Databricks workspace.",
+                "💡 **Common reasons for failure:**",
+                "• Insufficient permissions for query execution",
+                "• Genie space configuration issues",
+                "• Query complexity or timeout",
+                "• Contact your workspace administrator if needed"
+            ])
+        
+        return "\n\n".join(response_parts), csv_bytes, filename, conv_id
+        
+    except Exception as e:
+        logger.error(f"Error processing optimized query attachment: {e}")
+        # Fallback to text-only response
+        response_parts = []
+        response_parts.append(f"Genie generated a query: {query_attachment.description}")
+        
+        if bot_state.show_sql_query:
+            response_parts.append(f"Query: ```sql\n{query_attachment.query}\n```")
+            
+        response_parts.append(f"⚠️ Could not retrieve query results: {str(e)}")
+        
+        return "\n\n".join(response_parts), None, None, conv_id
+
+
+def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
+    """Optimized Genie interaction using SDK best practices and built-in waiters."""
+    start_time = time.time()
+    api_slot_acquired = False
+    
+    try:
+        logger.info(f"Processing query with SDK waiters: {msg_input[:50]}...")
+        
+        # Wait for API slot and check rate limits
+        if not wait_for_genie_api_slot(bot_state):
+            return "⏳ System is at capacity. Please try again in a moment.", None, None, None
+        
+        api_slot_acquired = True
+        
+        if not check_genie_rate_limit(bot_state):
+            return "⏳ Rate limit reached. Please wait a moment before trying again.", None, None, None
+        
+        # Use SDK's built-in waiters instead of custom polling
+        try:
+            if conversation_id:
+                logger.info(f"Continuing conversation {conversation_id} with SDK waiter")
+                # Use SDK's create_message_and_wait instead of manual polling
+                message_result = workspace_client.genie.create_message_and_wait(
+                    space_id=str(bot_state.genie_space_id),
+                    conversation_id=conversation_id,
+                    content=msg_input,
+                    timeout=timedelta(minutes=10)  # SDK handles this properly
+                )
+                conv_id = conversation_id
+            else:
+                logger.info("Starting new conversation with SDK waiter")
+                # Use SDK's start_conversation_and_wait instead of manual polling
+                message_result = workspace_client.genie.start_conversation_and_wait(
+                    space_id=str(bot_state.genie_space_id),
+                    content=msg_input,
+                    timeout=timedelta(minutes=10)
+                )
+                # Extract conversation ID from the message result
+                conv_id = extract_conversation_id_from_message(message_result)
+        
+        except PermissionDenied as e:
+            logger.error(f"Permission denied: {e}")
+            return f"❌ Access denied: {e}", None, None, conversation_id
+        except ResourceDoesNotExist as e:
+            logger.error(f"Resource not found: {e}")
+            return f"❌ Genie space not found: {e}", None, None, conversation_id
+        except BadRequest as e:
+            logger.error(f"Bad request: {e}")
+            return f"❌ Invalid request: {e}", None, None, conversation_id
+        except TooManyRequests as e:
+            logger.error(f"Rate limit exceeded: {e}")
+            return f"❌ Rate limit exceeded. Please try again later: {e}", None, None, conversation_id
+        except InternalError as e:
+            logger.error(f"Internal error: {e}")
+            return f"❌ Databricks service temporarily unavailable: {e}", None, None, conversation_id
+        
+        if not message_result:
+            return "Error: Failed to get message response from Genie.", None, None, conv_id
+
+        # Extract and process content using existing logic
+        genie_text_response, genie_query_attachment, attachment_id = extract_message_content(message_result)
+        
+        if genie_query_attachment:
+            # Process query attachment with SDK best practices
+            result = process_query_attachment_optimized(
+                workspace_client, conv_id, message_result, attachment_id, 
+                genie_query_attachment, genie_text_response, bot_state
+            )
+        else:
+            # Return text-only response
+            response_text = ' '.join(genie_text_response) if genie_text_response else 'No response from Genie.'
+            
+            # Clean up response - remove echoed input if it appears at the beginning
+            if response_text.lower().startswith(msg_input.lower().strip()):
+                cleaned_response = response_text[len(msg_input):].strip()
+                if cleaned_response:
+                    response_text = cleaned_response
+            
+            result = f"Genie: {response_text}", None, None, conv_id
+        
+        response_time = time.time() - start_time
+        if bot_state and hasattr(bot_state, 'performance_monitor'):
+            bot_state.performance_monitor.record_query(response_time, success=True)
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error in optimized Genie communication: {e}")
+        response_time = time.time() - start_time
+        if bot_state and hasattr(bot_state, 'performance_monitor'):
+            bot_state.performance_monitor.record_query(response_time, success=False)
+        return create_error_response(e, "Genie communication")
+    
+    finally:
+        # Always release the API slot
+        if api_slot_acquired:
+            release_genie_api_slot(bot_state)
 
 
 if __name__ == '__main__':

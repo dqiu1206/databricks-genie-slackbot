@@ -4,4 +4,3 @@ slackbot/__pycache__/
 slackbot/.databricks
 .vscode
 .env
-app.yaml
